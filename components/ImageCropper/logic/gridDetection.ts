@@ -20,11 +20,14 @@ export const detectGrid = (
 
     const getLum = (idx: number) => (data[idx] + data[idx+1] + data[idx+2]);
     
-    // Lower contrast threshold for better sensitivity on light lines
-    const CONTRAST_THRESH = 45;
-    const MIN_SEG_LEN = Math.max(32, Math.min(width, height) * 0.02);
-    const GAP_TOLERANCE = 10;
-    const POS_TOLERANCE = 5;
+    // Increased contrast threshold to ignore fainter noise/text
+    const CONTRAST_THRESH = 50;
+    // Increased minimum segment length to 3% of min dimension or 40px
+    // This aggressively filters out text underlines and small artifacts
+    const MIN_SEG_LEN = Math.max(40, Math.min(width, height) * 0.03);
+    
+    const GAP_TOLERANCE = 8;
+    const POS_TOLERANCE = 6;
 
     // --- Horizontal Scan ---
     const rawH: Segment[] = [];
@@ -36,6 +39,8 @@ export const detectGrid = (
             const idxUp = ((y - 1) * width + x) * 4;
             const idxDown = ((y + 1) * width + x) * 4;
             const lum = getLum(idx);
+            
+            // Basic edge detection
             const isEdge = Math.abs(lum - getLum(idxUp)) > CONTRAST_THRESH || 
                            Math.abs(lum - getLum(idxDown)) > CONTRAST_THRESH;
 
@@ -65,6 +70,7 @@ export const detectGrid = (
             const idxLeft = (y * width + (x - 1)) * 4;
             const idxRight = (y * width + (x + 1)) * 4;
             const lum = getLum(idx);
+            
             const isEdge = Math.abs(lum - getLum(idxLeft)) > CONTRAST_THRESH || 
                            Math.abs(lum - getLum(idxRight)) > CONTRAST_THRESH;
 

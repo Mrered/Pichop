@@ -8,7 +8,14 @@ export interface CropResult {
   grid?: Grid;
 }
 
-// Helper: Calculate "Energy" (contrast/detail) in a specific rectangular region
+// Instruction for the renderer
+interface DrawOperation {
+    srcStart: number;
+    srcLen: number;
+    destLen: number; // If destLen < srcLen, content is squished
+}
+
+// Calculate "Energy" (contrast/detail) in a specific rectangular region
 const getRegionEnergy = (
     data: Uint8ClampedArray, 
     width: number, 
@@ -19,6 +26,7 @@ const getRegionEnergy = (
 ) => {
     let energy = 0;
     const stride = 2; // Optimization: Skip pixels
+    let pixelsChecked = 0;
     
     // Bounds check
     const maxY = Math.min(startY + h, data.length / 4 / width);
@@ -26,6 +34,7 @@ const getRegionEnergy = (
 
     for (let y = Math.max(0, startY); y < maxY; y += stride) {
         for (let x = Math.max(0, startX); x < maxX - 1; x += stride) {
+            pixelsChecked++;
             const idx = (y * width + x) * 4;
             // Simple edge detection: |Current - Next|
             const r1 = data[idx], g1 = data[idx+1], b1 = data[idx+2];
@@ -33,16 +42,20 @@ const getRegionEnergy = (
             
             // Weight brightness (prefer white backgrounds for cuts)
             const brightness = (r1 + g1 + b1) / 3;
-            // Heavily penalize dark pixels (text)
-            const whitePenalty = brightness > 230 ? 0 : (255 - brightness) * 2;
-
-            energy += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2) + whitePenalty;
+            // Heavily penalize dark pixels (text usually)
+            // If pixel is not white/light grey, add penalty
+            const isDark = brightness < 230; 
+            const diff = Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+            
+            if (isDark) energy += (diff + 20); // Base penalty for just being dark
+            else energy += diff;
         }
     }
-    return energy;
+    // Return Average Energy per pixel to be size-invariant
+    return pixelsChecked > 0 ? energy / pixelsChecked : 0;
 };
 
-// Find the best 'safe' zone of size `targetSize` within a specific `cell`
+// Find the best 'safe' zone
 const findSafeZone = (
     data: Uint8ClampedArray, 
     imgW: number, 
@@ -50,27 +63,20 @@ const findSafeZone = (
     cell: Rect, 
     targetSize: number, 
     defaultStart: number,
-    axis: 'vertical' | 'horizontal' // 'vertical' = finding a Y range to cut (for removing rows)
-): number => {
+    axis: 'vertical' | 'horizontal' 
+): { pos: number, energy: number } => {
     let minEnergy = Infinity;
     let bestPos = defaultStart;
     
-    // Safety padding
     const padding = 2;
 
     if (axis === 'vertical') {
-        // We are removing a Row. Slide this window vertically inside the cell.
         const searchStart = cell.y + padding;
         const searchEnd = (cell.y + cell.h) - targetSize - padding;
         
-        // If cell is smaller than the cut, check if we can just align it with the cell edge?
-        // Fallback: If cut is larger than cell, we can't hide it inside. 
-        // We just return default behavior.
-        if (searchEnd <= searchStart) return defaultStart;
+        if (searchEnd <= searchStart) return { pos: defaultStart, energy: Infinity };
 
-        // Step size for search
         const step = 2;
-
         for (let y = searchStart; y <= searchEnd; y += step) {
             const energy = getRegionEnergy(data, imgW, cell.x, y, cell.w, targetSize);
             if (energy < minEnergy) {
@@ -79,11 +85,10 @@ const findSafeZone = (
             }
         }
     } else {
-        // Horizontal axis search (removing column). Slide window horizontally.
         const searchStart = cell.x + padding;
         const searchEnd = (cell.x + cell.w) - targetSize - padding;
 
-        if (searchEnd <= searchStart) return defaultStart;
+        if (searchEnd <= searchStart) return { pos: defaultStart, energy: Infinity };
 
         const step = 2;
         for (let x = searchStart; x <= searchEnd; x += step) {
@@ -95,11 +100,11 @@ const findSafeZone = (
         }
     }
 
-    return bestPos;
+    return { pos: bestPos, energy: minEnergy };
 };
 
-// Helper: Generate "Keep Ranges" for a single strip (row or column)
-const getLocalKeepRanges = (
+// --- CORE LOGIC: Generate Draw Operations ---
+const getStripOperations = (
     totalSize: number, 
     removeRanges: {start: number, end: number}[], 
     axisCells: Rect[], 
@@ -110,62 +115,127 @@ const getLocalKeepRanges = (
     imgW: number,
     imgH: number,
     isVerticalCut: boolean 
-) => {
-    if (!smartMode || !imgData) {
-         return invertRanges(totalSize, removeRanges);
-    }
+): DrawOperation[] => {
+    
+    // Helper to fallback to standard cutting
+    const createStandardCuts = () => {
+        const keep = invertRanges(totalSize, removeRanges);
+        return keep.map(k => ({ srcStart: k.start, srcLen: k.end - k.start, destLen: k.end - k.start }));
+    };
 
-    const adjustedRemoves = removeRanges.map(r => {
+    if (!smartMode || !imgData) return createStandardCuts();
+
+    // 1. Determine Strategy for each Cut (Physical Cut vs Squish)
+    const physicalCuts: {start: number, end: number}[] = [];
+    const cellSquishMap = new Map<number, number>(); // cellIndex -> total pixels to squish
+
+    // Average Energy Threshold. 
+    // Pure noise is usually < 1.0. Text lines are usually > 10.0.
+    const UNSAFE_ENERGY_THRESHOLD = 5.0; 
+
+    removeRanges.forEach(r => {
         const rSize = r.end - r.start;
-        
-        // Find a cell that conflicts with this cut in this strip.
-        // We look for cells that physically overlap the strip AND the cut region.
-        const conflictingCell = axisCells.find(c => {
+
+        // Find intersecting cell (Must cover the strip width to be relevant)
+        const cellIdx = axisCells.findIndex(c => {
             if (isVerticalCut) {
-                // Processing a vertical strip (Column). Check if cell covers this X-range.
                 const cellCoversStrip = (c.x < stripEnd) && (c.x + c.w > stripStart);
-                if (!cellCoversStrip) return false;
-                
-                // Check if the global Y-cut hits this cell.
-                // Looser check: If the cut overlaps the cell significantly (intersection > 0)
-                const overlapStart = Math.max(c.y, r.start);
-                const overlapEnd = Math.min(c.y + c.h, r.end);
-                
-                // Only consider it a "Smart Avoidance" scenario if the cut is essentially 
-                // passing THROUGH the cell (i.e., the cell is bigger than the cut).
-                // If the cut swallows the cell, we just delete the cell.
-                
-                // FIX: Use c.h (height) for Y-axis check, not c.w
-                const isThroughCut = (c.y <= r.start + 5) && (c.y + c.h >= r.end - 5);
-                return isThroughCut;
-
+                const cutInCell = (c.y <= r.start + 5) && (c.y + c.h >= r.end - 5);
+                return cellCoversStrip && cutInCell;
             } else {
-                // Processing a horizontal strip (Row). Check if cell covers this Y-range.
                 const cellCoversStrip = (c.y < stripEnd) && (c.y + c.h > stripStart);
-                if (!cellCoversStrip) return false;
-
-                // Check if global X-cut hits this cell
-                const isThroughCut = (c.x <= r.start + 5) && (c.x + c.w >= r.end - 5);
-                return isThroughCut;
+                const cutInCell = (c.x <= r.start + 5) && (c.x + c.w >= r.end - 5);
+                return cellCoversStrip && cutInCell;
             }
         });
 
-        if (conflictingCell) {
-            const bestStart = findSafeZone(
-                imgData, 
-                imgW, 
-                imgH,
-                conflictingCell, 
-                rSize, 
-                r.start, 
+        if (cellIdx !== -1) {
+            const cell = axisCells[cellIdx];
+            const best = findSafeZone(
+                imgData, imgW, imgH, cell, rSize, r.start, 
                 isVerticalCut ? 'vertical' : 'horizontal'
             );
-            return { start: bestStart, end: bestStart + rSize };
+
+            if (best.energy < UNSAFE_ENERGY_THRESHOLD) {
+                physicalCuts.push({ start: best.pos, end: best.pos + rSize });
+            } else {
+                const currentSquish = cellSquishMap.get(cellIdx) || 0;
+                cellSquishMap.set(cellIdx, currentSquish + rSize);
+            }
+        } else {
+            // Not in a cell (gap), just cut it
+            physicalCuts.push(r);
         }
-        return r;
     });
 
-    return invertRanges(totalSize, adjustedRemoves);
+    // 2. Generate Breakpoints (Micro-Segments)
+    const boundaries = new Set<number>();
+    boundaries.add(0);
+    boundaries.add(totalSize);
+    
+    physicalCuts.forEach(r => {
+        boundaries.add(r.start);
+        boundaries.add(r.end);
+    });
+
+    cellSquishMap.forEach((_, cellIdx) => {
+        const c = axisCells[cellIdx];
+        if (isVerticalCut) {
+            boundaries.add(Math.max(0, c.y));
+            boundaries.add(Math.min(totalSize, c.y + c.h));
+        } else {
+            boundaries.add(Math.max(0, c.x));
+            boundaries.add(Math.min(totalSize, c.x + c.w));
+        }
+    });
+
+    const sortedPoints = Array.from(boundaries).sort((a,b) => a - b);
+    const finalOps: DrawOperation[] = [];
+
+    // 3. Iterate Segments
+    for (let i = 0; i < sortedPoints.length - 1; i++) {
+        const start = sortedPoints[i];
+        const end = sortedPoints[i+1];
+        const len = end - start;
+        const mid = start + len / 2;
+
+        if (len <= 0) continue;
+
+        // Is this segment inside a physical cut? -> Skip it
+        const isCut = physicalCuts.some(cut => mid >= cut.start && mid <= cut.end);
+        if (isCut) continue;
+
+        // Is this segment inside a Squish Cell? -> Apply Scale
+        const cellIdx = axisCells.findIndex(c => {
+             // CRITICAL FIX: Must ensure the cell is actually in the current strip
+             // otherwise we might match a cell from a different column/row with same coords.
+             if (isVerticalCut) {
+                 const inStrip = (c.x < stripEnd) && (c.x + c.w > stripStart);
+                 return inStrip && mid >= c.y && mid <= c.y + c.h;
+             } else {
+                 const inStrip = (c.y < stripEnd) && (c.y + c.h > stripStart);
+                 return inStrip && mid >= c.x && mid <= c.x + c.w;
+             }
+        });
+
+        let scale = 1.0;
+        if (cellIdx !== -1 && cellSquishMap.has(cellIdx)) {
+            const squishAmount = cellSquishMap.get(cellIdx)!;
+            const c = axisCells[cellIdx];
+            const originalDim = isVerticalCut ? c.h : c.w;
+            const safeDim = Math.max(originalDim, 1);
+            const targetDim = Math.max(1, safeDim - squishAmount);
+            scale = targetDim / safeDim;
+        }
+
+        finalOps.push({
+            srcStart: start,
+            srcLen: len,
+            destLen: len * scale
+        });
+    }
+
+    return finalOps;
 };
 
 const invertRanges = (totalSize: number, removeRanges: {start: number, end: number}[]) => {
@@ -258,23 +328,22 @@ export const processImageCrop = async (
                 }
 
                 vStrips.forEach(strip => {
-                    const keepRanges = getLocalKeepRanges(
+                    const ops = getStripOperations(
                         item.height, globalYRanges, cells, 
                         strip.start, strip.end, 
                         smartMode, originalData, item.width, item.height, true
                     );
                     
                     let destY = 0;
-                    keepRanges.forEach(k => {
-                        const h = k.end - k.start;
-                        if (h > 0) {
+                    ops.forEach(op => {
+                        if (op.destLen > 0.01) {
                             pass1Ctx.drawImage(
                                 canvas, 
-                                strip.start, k.start, strip.end - strip.start, h,
-                                strip.start, destY, strip.end - strip.start, h
+                                strip.start, op.srcStart, strip.end - strip.start, op.srcLen, // Source
+                                strip.start, destY, strip.end - strip.start, op.destLen   // Dest
                             );
                         }
-                        destY += h;
+                        destY += op.destLen;
                     });
                 });
             } else {
@@ -316,30 +385,29 @@ export const processImageCrop = async (
                 }
 
                 hStrips.forEach(strip => {
-                    const keepRanges = getLocalKeepRanges(
+                    const ops = getStripOperations(
                         item.width, globalXRanges, mappedCells, 
                         strip.start, strip.end, 
                         smartMode, pass1Raw, pass1Canvas.width, pass1Canvas.height, false
                     );
                     
                     let destX = 0;
-                    keepRanges.forEach(k => {
-                        const w = k.end - k.start;
-                        if (w > 0) {
+                    ops.forEach(op => {
+                        if (op.destLen > 0.01) {
                             finalCtx.drawImage(
                                 pass1Canvas, 
-                                k.start, strip.start, w, strip.end - strip.start,
-                                destX, strip.start, w, strip.end - strip.start
+                                op.srcStart, strip.start, op.srcLen, strip.end - strip.start,
+                                destX, strip.start, op.destLen, strip.end - strip.start
                             );
                         }
-                        destX += w;
+                        destX += op.destLen;
                     });
                 });
             } else {
                 finalCtx.drawImage(pass1Canvas, 0, 0);
             }
 
-            // Grid Persistence (Mapped to GLOBAL changes to maintain structure)
+            // --- Grid Persistence ---
             const mapX = (x: number) => {
                 let shift = 0;
                 for(const r of globalXRanges) {
