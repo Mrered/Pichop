@@ -7,6 +7,7 @@ interface CanvasViewProps {
   width: number;
   height: number;
   scale: number;
+  pan: { x: number, y: number };
   grid: Grid | null;
   selections: Rect[];
   currentDrag: Rect | null;
@@ -17,12 +18,13 @@ interface CanvasViewProps {
   onPointerDown: (e: React.MouseEvent | React.TouchEvent) => void;
   onPointerMove: (e: React.MouseEvent | React.TouchEvent) => void;
   onPointerUp: (e: React.MouseEvent | React.TouchEvent) => void;
+  onWheel: (e: React.WheelEvent) => void;
 }
 
 export const CanvasView: React.FC<CanvasViewProps> = ({
-  imageSrc, width, height, scale, grid, selections, currentDrag, 
+  imageSrc, width, height, scale, pan, grid, selections, currentDrag, 
   isScanning, isEditingGrid, hoveredCell, hoveredSegment,
-  onPointerDown, onPointerMove, onPointerUp
+  onPointerDown, onPointerMove, onPointerUp, onWheel
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const scanProgressRef = useRef(0);
@@ -203,7 +205,7 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
 
     render();
     return () => cancelAnimationFrame(animationRef.current);
-  }, [imageSrc, width, height, scale, grid, selections, currentDrag, isScanning, isEditingGrid, hoveredCell, hoveredSegment]);
+  }, [imageSrc, width, height, scale, pan, grid, selections, currentDrag, isScanning, isEditingGrid, hoveredCell, hoveredSegment]);
 
   return (
     <div 
@@ -212,17 +214,18 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
         onMouseMove={onPointerMove}
         onMouseUp={onPointerUp}
         onMouseLeave={onPointerUp}
+        onWheel={onWheel}
         onTouchStart={onPointerDown}
         onTouchMove={onPointerMove}
         onTouchEnd={onPointerUp}
     >
         <div 
             style={{ 
-                transform: `scale(${scale})`, 
+                transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`, 
                 transformOrigin: 'center',
-                transition: currentDrag ? 'none' : 'transform 0.2s cubic-bezier(0.2, 0, 0, 1)'
+                transition: currentDrag ? 'none' : 'transform 0.05s linear' // Faster transition for smooth pan/zoom
             }}
-            className={`shadow-2xl shadow-black/20 dark:shadow-black/50 transition-opacity duration-500 ${isScanning ? 'opacity-90' : 'opacity-100'}`}
+            className={`shadow-2xl shadow-black/20 dark:shadow-black/50 ${isScanning ? 'opacity-90' : 'opacity-100'}`}
         >
             <canvas ref={canvasRef} className="block bg-white dark:bg-slate-800" />
         </div>

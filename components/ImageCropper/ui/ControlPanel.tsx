@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { Undo2, Redo2, Download, FoldVertical, FoldHorizontal, Shrink, Eraser, Sparkles } from 'lucide-react';
 import { CropMode } from '../../../types';
@@ -9,6 +8,8 @@ interface ControlPanelProps {
   hasSelection: boolean;
   isEditingGrid: boolean;
   smartMode: boolean;
+  eraserMode: 'segment' | 'line';
+  setEraserMode: (mode: 'segment' | 'line') => void;
   onToggleSmartMode: () => void;
   onToggleEraser: () => void;
   onCrop: (mode: CropMode) => void;
@@ -19,6 +20,7 @@ interface ControlPanelProps {
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
   historyIndex, historyLength, hasSelection, isEditingGrid, smartMode,
+  eraserMode, setEraserMode,
   onToggleSmartMode, onToggleEraser, onCrop, onUndo, onRedo, onDownload
 }) => {
   return (
@@ -37,15 +39,34 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
       <div className="flex-1 overflow-y-auto p-4 md:p-6 min-h-0">
           <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 md:mb-4">工具</h2>
            <div className="mb-4 space-y-3">
-              <button 
-                  onClick={onToggleEraser}
-                  className={`w-full flex items-center justify-center gap-2 p-3 rounded-xl border transition-all ${isEditingGrid 
-                      ? 'bg-red-50 dark:bg-red-900/20 border-red-500 text-red-600 dark:text-red-400' 
-                      : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'}`}
-              >
-                  <Eraser size={18} />
-                  <span className="font-medium">{isEditingGrid ? '完成编辑' : '手动擦除表格线'}</span>
-              </button>
+              <div className="space-y-2">
+                <button 
+                    onClick={onToggleEraser}
+                    className={`w-full flex items-center justify-center gap-2 p-3 rounded-xl border transition-all ${isEditingGrid 
+                        ? 'bg-red-50 dark:bg-red-900/20 border-red-500 text-red-600 dark:text-red-400' 
+                        : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'}`}
+                >
+                    <Eraser size={18} />
+                    <span className="font-medium">{isEditingGrid ? '完成编辑' : '手动擦除表格线'}</span>
+                </button>
+                
+                {isEditingGrid && (
+                  <div className="flex bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700">
+                    <button 
+                      onClick={() => setEraserMode('segment')} 
+                      className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${eraserMode === 'segment' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm ring-1 ring-black/5 dark:ring-white/5' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}
+                    >
+                      擦除线段
+                    </button>
+                    <button 
+                      onClick={() => setEraserMode('line')} 
+                      className={`flex-1 py-1.5 text-xs font-medium rounded-md transition-all ${eraserMode === 'line' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm ring-1 ring-black/5 dark:ring-white/5' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}
+                    >
+                      擦除整行
+                    </button>
+                  </div>
+                )}
+              </div>
               
               <div 
                 onClick={onToggleSmartMode}

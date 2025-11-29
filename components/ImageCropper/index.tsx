@@ -1,4 +1,3 @@
-
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Rect, HistoryItem, CropMode, Grid } from '../../types';
 import { detectGrid } from './logic/gridDetection';
@@ -18,11 +17,14 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [scale, setScale] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 }); // Navigation pan
   
   const [selections, setSelections] = useState<Rect[]>([]);
   const [currentDrag, setCurrentDrag] = useState<Rect | null>(null);
   const [grid, setGrid] = useState<Grid | null>(null);
   const [isEditingGrid, setIsEditingGrid] = useState(false);
+  const [eraserMode, setEraserMode] = useState<'segment' | 'line'>('segment'); // 'segment' | 'line'
+
   const [isScanning, setIsScanning] = useState(false);
   const [showToast, setShowToast] = useState(true);
   const [smartMode, setSmartMode] = useState(true); // Default to Smart Mode
@@ -37,6 +39,16 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   // Logic Refs
   const gridSnapshotRef = useRef<Grid | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  
+  // Gesture Refs
+  const gestureRef = useRef({
+    isGesturing: false,
+    startDist: 0,
+    startScale: 1,
+    startPan: { x: 0, y: 0 },
+    startCenter: { x: 0, y: 0 }, // Center of fingers relative to viewport
+    containerCenter: { x: 0, y: 0 } // Center of container relative to viewport
+  });
 
   // --- Init ---
   useEffect(() => {
@@ -89,6 +101,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         const scaleX = (clientWidth - padding) / currentW;
         const scaleY = (clientHeight - padding) / currentH;
         setScale(Math.min(scaleX, scaleY, 1.0)); 
+        setPan({ x: 0, y: 0 }); // Reset Pan
     }
   }, [history, historyIndex]);
 
@@ -115,8 +128,9 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     const visualW = item.width * scale;
     const visualH = item.height * scale;
     
-    const offsetX = (rect.width - visualW) / 2;
-    const offsetY = (rect.height - visualH) / 2;
+    // Apply pan to offset
+    const offsetX = (rect.width - visualW) / 2 + pan.x;
+    const offsetY = (rect.height - visualH) / 2 + pan.y;
 
     const relX = clientX - rect.left - offsetX;
     const relY = clientY - rect.top - offsetY;
@@ -151,14 +165,44 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
 
   // --- Interaction Handlers ---
   const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
+    // Multi-touch Gesture Start
+    if ('touches' in e && e.touches.length === 2) {
+       e.preventDefault();
+       gestureRef.current.isGesturing = true;
+       const t1 = e.touches[0];
+       const t2 = e.touches[1];
+       
+       // Calculate initial distance
+       const dist = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+       
+       // Calculate initial center of fingers
+       const cx = (t1.clientX + t2.clientX) / 2;
+       const cy = (t1.clientY + t2.clientY) / 2;
+       
+       // Capture container center to perform math relative to it
+       let containerCenter = { x: 0, y: 0 };
+       if (containerRef.current) {
+           const rect = containerRef.current.getBoundingClientRect();
+           containerCenter = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+       }
+       
+       gestureRef.current.startDist = dist;
+       gestureRef.current.startScale = scale;
+       gestureRef.current.startPan = { ...pan };
+       gestureRef.current.startCenter = { x: cx, y: cy };
+       gestureRef.current.containerCenter = containerCenter;
+       return;
+    }
+
     e.stopPropagation();
-    if ('touches' in e && e.touches.length > 1) return;
     const coords = getPointerCoords(e);
+
+    const useLineEraser = eraserMode === 'line' || e.altKey || (e as React.MouseEvent).metaKey;
 
     if (isEditingGrid && grid) {
         setIsDragging(true);
         gridSnapshotRef.current = JSON.parse(JSON.stringify(grid));
-        const newGrid = performErase(grid, coords, e.altKey || e.metaKey, scale);
+        const newGrid = performErase(grid, coords, useLineEraser, scale);
         if (newGrid) setGrid(newGrid);
         return;
     }
@@ -169,20 +213,50 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   };
 
   const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
+    // Multi-touch Gesture Move (Zoom + Pan)
+    if ('touches' in e && e.touches.length === 2 && gestureRef.current.isGesturing) {
+        e.preventDefault();
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        
+        // 1. Calculate New Zoom
+        const dist = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+        const newScale = Math.max(0.1, Math.min(5, gestureRef.current.startScale * (dist / gestureRef.current.startDist)));
+
+        // 2. Calculate Pan to keep focal point stable
+        const cx = (t1.clientX + t2.clientX) / 2;
+        const cy = (t1.clientY + t2.clientY) / 2;
+        
+        const C = gestureRef.current.containerCenter;
+        const F_start = gestureRef.current.startCenter;
+        const Pan_start = gestureRef.current.startPan;
+        const Scale_start = gestureRef.current.startScale;
+        
+        // Formula: Pan_new = F_curr - C - (F_start - C - Pan_start) * (Scale_new / Scale_start)
+        // This ensures the point under the fingers remains under the fingers while scaling.
+        const scaleRatio = newScale / Scale_start;
+        const newPanX = cx - C.x - (F_start.x - C.x - Pan_start.x) * scaleRatio;
+        const newPanY = cy - C.y - (F_start.y - C.y - Pan_start.y) * scaleRatio;
+        
+        setScale(newScale);
+        setPan({ x: newPanX, y: newPanY });
+        return;
+    }
+
     const coords = getPointerCoords(e);
+    const useLineEraser = eraserMode === 'line' || e.altKey || (e as React.MouseEvent).metaKey;
 
     if (isEditingGrid && isDragging && grid) {
-        const newGrid = performErase(grid, coords, e.altKey || e.metaKey, scale);
+        const newGrid = performErase(grid, coords, useLineEraser, scale);
         if (newGrid) setGrid(newGrid);
         return;
     }
 
     if (isEditingGrid && grid) {
-        // MATCHED THRESHOLD: 6/scale to match performErase.
         const threshold = 6 / scale;
         let bestSeg: EraserHover | null = null;
         let minDest = threshold;
-        const isWholeLine = e.altKey || e.metaKey;
+        const isWholeLine = useLineEraser;
 
         const check = (type: 'horizontal'|'vertical') => {
             const lines = type === 'horizontal' ? grid.horizontal : grid.vertical;
@@ -230,6 +304,13 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   };
 
   const handlePointerUp = (e: React.MouseEvent | React.TouchEvent) => {
+    // End Gesture
+    if (gestureRef.current.isGesturing) {
+        if (!('touches' in e) || e.touches.length < 2) {
+            gestureRef.current.isGesturing = false;
+        }
+    }
+    
     setIsDragging(false);
     
     if (isEditingGrid) {
@@ -261,6 +342,18 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         }
     }
     setCurrentDrag(null);
+  };
+  
+  const handleWheel = (e: React.WheelEvent) => {
+      // Allow trackpad pinch-zoom or mouse wheel zoom
+      if (e.ctrlKey) {
+          e.preventDefault();
+          const zoomFactor = -e.deltaY * 0.01;
+          const newScale = Math.max(0.1, Math.min(5, scale + zoomFactor));
+          setScale(newScale);
+      } else {
+          // Pan on normal scroll if desired, or just ignore
+      }
   };
 
   // --- Actions ---
@@ -302,6 +395,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 width={currentItem.width}
                 height={currentItem.height}
                 scale={scale}
+                pan={pan}
                 grid={grid}
                 selections={selections}
                 currentDrag={currentDrag}
@@ -312,6 +406,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
                 onPointerUp={handlePointerUp}
+                onWheel={handleWheel}
             />
         )}
         
@@ -333,6 +428,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
           hasSelection={selections.length > 0}
           isEditingGrid={isEditingGrid}
           smartMode={smartMode}
+          eraserMode={eraserMode}
+          setEraserMode={setEraserMode}
           onToggleSmartMode={() => setSmartMode(!smartMode)}
           onToggleEraser={() => { setIsEditingGrid(!isEditingGrid); setSelections([]); }}
           onCrop={handleCrop}
