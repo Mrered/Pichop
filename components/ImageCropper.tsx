@@ -890,7 +890,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         if (!ctx) return;
 
         ctx.drawImage(img, 0, 0);
-        const fullImageData = ctx.getImageData(0, 0, img.width, img.height);
         
         // 1. Calculate Ranges
         let xRanges: {start: number, end: number}[] = [];
@@ -1008,97 +1007,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             }).filter(Boolean) as GridLine[];
             
             nextGrid = { horizontal: nextH, vertical: nextV };
-        }
-
-        // 4. Smart Content Restoration (Using Flood Fill Cells)
-        if (grid) {
-             const actualCells = getActualCells(grid, currentItem.width, currentItem.height);
-             
-             for (const cell of actualCells) {
-                 // Calculate Target Geometry
-                 const nx1 = mapX(cell.x);
-                 const nx2 = mapX(cell.x + cell.w);
-                 const ny1 = mapY(cell.y);
-                 const ny2 = mapY(cell.y + cell.h);
-                 const targetW = nx2 - nx1;
-                 const targetH = ny2 - ny1;
-
-                 // Check impact
-                 if (Math.abs(targetW - cell.w) < 2 && Math.abs(targetH - cell.h) < 2) continue;
-                 if (targetW < 4 || targetH < 4) continue;
-
-                 // Restore Content
-                 // Sample BG
-                 const sX = Math.min(img.width - 1, Math.floor(cell.x + 4));
-                 const sY = Math.min(img.height - 1, Math.floor(cell.y + 4));
-                 const sIdx = (sY * img.width + sX) * 4;
-                 const bgR = fullImageData.data[sIdx];
-                 const bgG = fullImageData.data[sIdx+1];
-                 const bgB = fullImageData.data[sIdx+2];
-
-                 // Extract
-                 const cellCanvas = document.createElement('canvas');
-                 cellCanvas.width = cell.w;
-                 cellCanvas.height = cell.h;
-                 const cCtx = cellCanvas.getContext('2d');
-                 if(!cCtx) continue;
-                 cCtx.drawImage(img, cell.x, cell.y, cell.w, cell.h, 0, 0, cell.w, cell.h);
-                 const d = cCtx.getImageData(0,0,cell.w, cell.h).data;
-
-                 let minCx = cell.w, minCy = cell.h, maxCx = 0, maxCy = 0;
-                 let hasContent = false;
-                 let sumX = 0; let pixelCount = 0;
-                 const tolerance = 30;
-
-                 for(let y=0; y<cell.h; y++) {
-                     for(let x=0; x<cell.w; x++) {
-                         const ii = (y * cell.w + x) * 4;
-                         if (Math.abs(d[ii] - bgR) > tolerance ||
-                             Math.abs(d[ii+1] - bgG) > tolerance ||
-                             Math.abs(d[ii+2] - bgB) > tolerance) {
-                             hasContent = true;
-                             if(x<minCx) minCx=x; if(x>maxCx) maxCx=x;
-                             if(y<minCy) minCy=y; if(y>maxCy) maxCy=y;
-                             sumX += x; pixelCount++;
-                         }
-                     }
-                 }
-
-                 if (!hasContent) continue;
-                 const contentW = maxCx - minCx + 1;
-                 const contentH = maxCy - minCy + 1;
-
-                 // Draw BG
-                 resCtx.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
-                 resCtx.fillRect(nx1, ny1, targetW, targetH);
-
-                 // Draw Content
-                 const contentCanvas = document.createElement('canvas');
-                 contentCanvas.width = contentW;
-                 contentCanvas.height = contentH;
-                 const ccCtx = contentCanvas.getContext('2d');
-                 ccCtx?.drawImage(cellCanvas, minCx, minCy, contentW, contentH, 0, 0, contentW, contentH);
-
-                 const centerMass = sumX / pixelCount;
-                 const geoCenter = cell.w / 2;
-                 let align = 'center';
-                 if (centerMass < geoCenter - cell.w * 0.1) align = 'left';
-                 else if (centerMass > geoCenter + cell.w * 0.1) align = 'right';
-
-                 const padding = 2;
-                 const availW = Math.max(1, targetW - padding*2);
-                 const availH = Math.max(1, targetH - padding*2);
-                 const scale = Math.min(1, availW / contentW, availH / contentH);
-                 const finalW = contentW * scale;
-                 const finalH = contentH * scale;
-
-                 let drawX = nx1 + padding;
-                 if (align === 'center') drawX = nx1 + (targetW - finalW) / 2;
-                 else if (align === 'right') drawX = nx2 - finalW - padding;
-                 const drawY = ny1 + (targetH - finalH) / 2;
-
-                 resCtx.drawImage(contentCanvas, drawX, drawY, finalW, finalH);
-             }
         }
 
         const newDataUrl = canvas.toDataURL();

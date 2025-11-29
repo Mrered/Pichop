@@ -1,6 +1,5 @@
 
 import { CropMode, Grid, GridLine, HistoryItem, Rect } from '../../../types';
-import { getActualCells } from './gridManipulation';
 
 export interface CropResult {
   dataUrl: string;
@@ -26,9 +25,8 @@ export const processImageCrop = async (
             if (!ctx) { resolve(null); return; }
 
             ctx.drawImage(img, 0, 0);
-            const fullImageData = ctx.getImageData(0, 0, img.width, img.height);
             
-            // 1. Calculate Ranges
+            // 1. Calculate Ranges to Remove
             let xRanges: {start: number, end: number}[] = [];
             let yRanges: {start: number, end: number}[] = [];
 
@@ -36,6 +34,9 @@ export const processImageCrop = async (
                 let rx = s.x, ry = s.y, rw = s.w, rh = s.h;
                 if (rw < 0) { rx += rw; rw = Math.abs(rw); }
                 if (rh < 0) { ry += rh; rh = Math.abs(rh); }
+                // Rounding to avoid sub-pixel artifacts in range calc
+                rx = Math.floor(rx); ry = Math.floor(ry);
+                rw = Math.ceil(rw); rh = Math.ceil(rh);
                 yRanges.push({ start: ry, end: ry + rh });
                 xRanges.push({ start: rx, end: rx + rw });
             });
@@ -56,7 +57,7 @@ export const processImageCrop = async (
             const finalXRanges = (mode === 'vertical' || mode === 'both') ? mergeRanges(xRanges) : [];
             const finalYRanges = (mode === 'horizontal' || mode === 'both') ? mergeRanges(yRanges) : [];
 
-            // 2. Stitch Background
+            // 2. Prepare Destination Canvas
             let removeW = finalXRanges.reduce((acc, r) => acc + (r.end - r.start), 0);
             let removeH = finalYRanges.reduce((acc, r) => acc + (r.end - r.start), 0);
             
@@ -68,6 +69,7 @@ export const processImageCrop = async (
             const resCtx = canvas.getContext('2d', { willReadFrequently: true });
             if(!resCtx) { resolve(null); return; }
 
+            // Coordinate Mapping Functions
             const mapX = (x: number) => {
                 let shift = 0;
                 for(const r of finalXRanges) {
@@ -85,6 +87,7 @@ export const processImageCrop = async (
                 return y - shift;
             };
 
+            // 3. Render Background (Stitching)
             const getKeepRanges = (totalSize: number, removeRanges: {start: number, end: number}[]) => {
                 const keep = [];
                 let cursor = 0;
@@ -113,7 +116,7 @@ export const processImageCrop = async (
                 destY += h;
             });
 
-            // 3. Grid Persistence
+            // 4. Grid Persistence
             let nextGrid: Grid | undefined = undefined;
             if (grid) {
                 const nextH = grid.horizontal.map(l => {
@@ -130,118 +133,6 @@ export const processImageCrop = async (
                      return { pos: mapX(l.pos), thickness: l.thickness, start: mapY(l.start), end: mapY(l.end) };
                 }).filter(Boolean) as GridLine[];
                 nextGrid = { horizontal: nextH, vertical: nextV };
-            }
-
-            // 4. Smart Content Restoration (Merged Cell Logic)
-            if (grid) {
-                 const actualCells = getActualCells(grid, item.width, item.height);
-                 
-                 for (const cell of actualCells) {
-                     const nx1 = mapX(cell.x);
-                     const nx2 = mapX(cell.x + cell.w);
-                     const ny1 = mapY(cell.y);
-                     const ny2 = mapY(cell.y + cell.h);
-                     const targetW = nx2 - nx1;
-                     const targetH = ny2 - ny1;
-
-                     // Only process if cell significantly shrunk or is small enough to care
-                     if (Math.abs(targetW - cell.w) < 2 && Math.abs(targetH - cell.h) < 2) continue;
-                     if (targetW < 4 || targetH < 4) continue;
-
-                     // A. Detect BG Color
-                     const samples: string[] = [];
-                     const sampleStep = Math.max(1, Math.floor((cell.w + cell.h) / 50));
-                     const addSample = (x: number, y: number) => {
-                         const idx = (Math.floor(y) * img.width + Math.floor(x)) * 4;
-                         samples.push(`${fullImageData.data[idx]},${fullImageData.data[idx+1]},${fullImageData.data[idx+2]}`);
-                     };
-                     // Sample perimeter
-                     for(let x=cell.x; x<cell.x+cell.w; x+=sampleStep) { addSample(x, cell.y+2); addSample(x, cell.y+cell.h-2); }
-                     for(let y=cell.y; y<cell.y+cell.h; y+=sampleStep) { addSample(cell.x+2, y); addSample(cell.x+cell.w-2, y); }
-                     
-                     const colorCounts: {[k: string]: number} = {};
-                     let maxCount = 0; 
-                     let bgStr = "255,255,255";
-                     for(const c of samples) {
-                         colorCounts[c] = (colorCounts[c] || 0) + 1;
-                         if(colorCounts[c] > maxCount) { maxCount = colorCounts[c]; bgStr = c; }
-                     }
-                     const [bgR, bgG, bgB] = bgStr.split(',').map(Number);
-
-                     // B. Extract Content
-                     const cellCanvas = document.createElement('canvas');
-                     cellCanvas.width = cell.w;
-                     cellCanvas.height = cell.h;
-                     const cCtx = cellCanvas.getContext('2d');
-                     if(!cCtx) continue;
-                     cCtx.drawImage(img, cell.x, cell.y, cell.w, cell.h, 0, 0, cell.w, cell.h);
-                     const d = cCtx.getImageData(0,0,cell.w, cell.h).data;
-
-                     let minCx = cell.w, minCy = cell.h, maxCx = 0, maxCy = 0;
-                     let hasContent = false;
-                     const tolerance = 30;
-
-                     for(let y=0; y<cell.h; y++) {
-                         for(let x=0; x<cell.w; x++) {
-                             const ii = (y * cell.w + x) * 4;
-                             if (Math.abs(d[ii] - bgR) > tolerance ||
-                                 Math.abs(d[ii+1] - bgG) > tolerance ||
-                                 Math.abs(d[ii+2] - bgB) > tolerance) {
-                                 hasContent = true;
-                                 if(x<minCx) minCx=x; if(x>maxCx) maxCx=x;
-                                 if(y<minCy) minCy=y; if(y>maxCy) maxCy=y;
-                             }
-                         }
-                     }
-
-                     if (!hasContent) {
-                         resCtx.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
-                         resCtx.fillRect(nx1, ny1, targetW, targetH);
-                         continue;
-                     }
-
-                     // C. Calculate Relative Position & Margin
-                     const dL = minCx;
-                     const dR = cell.w - maxCx;
-                     const dT = minCy;
-                     const dB = cell.h - maxCy;
-                     const k = Math.min(dL, dR, dT, dB);
-                     
-                     // Dimensions of "Content + Min Margin"
-                     const cmW = (maxCx - minCx) + 2 * k; 
-                     const cmH = (maxCy - minCy) + 2 * k;
-
-                     const contentCenterX = minCx + (maxCx - minCx) / 2;
-                     const contentCenterY = minCy + (maxCy - minCy) / 2;
-                     const pctX = contentCenterX / cell.w;
-                     const pctY = contentCenterY / cell.h;
-
-                     // D. Draw Background
-                     resCtx.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
-                     resCtx.fillRect(nx1, ny1, targetW, targetH);
-
-                     // E. Draw Content Scaled & Positioned
-                     const targetCenterX = targetW * pctX;
-                     const targetCenterY = targetH * pctY;
-
-                     // Adaptive Scale (Contain)
-                     const scale = Math.min(1, targetW / cmW, targetH / cmH);
-                     
-                     const finalBoxW = cmW * scale;
-                     const finalBoxH = cmH * scale;
-
-                     // Box Position
-                     const boxDrawX = nx1 + targetCenterX - finalBoxW / 2;
-                     const boxDrawY = ny1 + targetCenterY - finalBoxH / 2;
-
-                     // Inner Image Position
-                     const imgDrawX = boxDrawX + k * scale;
-                     const imgDrawY = boxDrawY + k * scale;
-                     const imgDrawW = (maxCx - minCx) * scale;
-                     const imgDrawH = (maxCy - minCy) * scale;
-
-                     resCtx.drawImage(cellCanvas, minCx, minCy, maxCx - minCx, maxCy - minCy, imgDrawX, imgDrawY, imgDrawW, imgDrawH);
-                 }
             }
 
             resolve({
