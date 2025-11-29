@@ -16,6 +16,7 @@ interface DrawOperation {
 }
 
 // Calculate "Energy" (contrast/detail) in a specific rectangular region
+// Optimized to return average energy per pixel
 const getRegionEnergy = (
     data: Uint8ClampedArray, 
     width: number, 
@@ -47,63 +48,14 @@ const getRegionEnergy = (
             const isDark = brightness < 230; 
             const diff = Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
             
-            if (isDark) energy += (diff + 20); // Base penalty for just being dark
+            if (isDark) energy += (diff + 20); 
             else energy += diff;
         }
     }
-    // Return Average Energy per pixel to be size-invariant
     return pixelsChecked > 0 ? energy / pixelsChecked : 0;
 };
 
-// Find the best 'safe' zone
-const findSafeZone = (
-    data: Uint8ClampedArray, 
-    imgW: number, 
-    imgH: number,
-    cell: Rect, 
-    targetSize: number, 
-    defaultStart: number,
-    axis: 'vertical' | 'horizontal' 
-): { pos: number, energy: number } => {
-    let minEnergy = Infinity;
-    let bestPos = defaultStart;
-    
-    const padding = 2;
-
-    if (axis === 'vertical') {
-        const searchStart = cell.y + padding;
-        const searchEnd = (cell.y + cell.h) - targetSize - padding;
-        
-        if (searchEnd <= searchStart) return { pos: defaultStart, energy: Infinity };
-
-        const step = 2;
-        for (let y = searchStart; y <= searchEnd; y += step) {
-            const energy = getRegionEnergy(data, imgW, cell.x, y, cell.w, targetSize);
-            if (energy < minEnergy) {
-                minEnergy = energy;
-                bestPos = y;
-            }
-        }
-    } else {
-        const searchStart = cell.x + padding;
-        const searchEnd = (cell.x + cell.w) - targetSize - padding;
-
-        if (searchEnd <= searchStart) return { pos: defaultStart, energy: Infinity };
-
-        const step = 2;
-        for (let x = searchStart; x <= searchEnd; x += step) {
-             const energy = getRegionEnergy(data, imgW, x, cell.y, targetSize, cell.h);
-             if (energy < minEnergy) {
-                 minEnergy = energy;
-                 bestPos = x;
-             }
-        }
-    }
-
-    return { pos: bestPos, energy: minEnergy };
-};
-
-// --- CORE LOGIC: Generate Draw Operations ---
+// --- NEW CORE LOGIC: Quota-Based Mixed Strategy ---
 const getStripOperations = (
     totalSize: number, 
     removeRanges: {start: number, end: number}[], 
@@ -117,7 +69,7 @@ const getStripOperations = (
     isVerticalCut: boolean 
 ): DrawOperation[] => {
     
-    // Helper to fallback to standard cutting
+    // Fallback: Simple physical cut
     const createStandardCuts = () => {
         const keep = invertRanges(totalSize, removeRanges);
         return keep.map(k => ({ srcStart: k.start, srcLen: k.end - k.start, destLen: k.end - k.start }));
@@ -125,117 +77,196 @@ const getStripOperations = (
 
     if (!smartMode || !imgData) return createStandardCuts();
 
-    // 1. Determine Strategy for each Cut (Physical Cut vs Squish)
-    const physicalCuts: {start: number, end: number}[] = [];
-    const cellSquishMap = new Map<number, number>(); // cellIndex -> total pixels to squish
+    // 0. Initialize maps
+    // pixelAction: 0 = Keep, 1 = Physical Cut
+    const pixelAction = new Uint8Array(totalSize).fill(0); 
+    const cellSquishDebt = new Map<number, number>(); 
+    const cellCutQuota = new Map<number, number>();
 
-    // Average Energy Threshold. 
-    // Pure noise is usually < 1.0. Text lines are usually > 10.0.
     const UNSAFE_ENERGY_THRESHOLD = 5.0; 
 
-    removeRanges.forEach(r => {
-        const rSize = r.end - r.start;
-
-        // Find intersecting cell (Must cover the strip width to be relevant)
-        const cellIdx = axisCells.findIndex(c => {
-            if (isVerticalCut) {
-                const cellCoversStrip = (c.x < stripEnd) && (c.x + c.w > stripStart);
-                const cutInCell = (c.y <= r.start + 5) && (c.y + c.h >= r.end - 5);
-                return cellCoversStrip && cutInCell;
-            } else {
-                const cellCoversStrip = (c.y < stripEnd) && (c.y + c.h > stripStart);
-                const cutInCell = (c.x <= r.start + 5) && (c.x + c.w >= r.end - 5);
-                return cellCoversStrip && cutInCell;
-            }
-        });
-
-        if (cellIdx !== -1) {
-            const cell = axisCells[cellIdx];
-            const best = findSafeZone(
-                imgData, imgW, imgH, cell, rSize, r.start, 
-                isVerticalCut ? 'vertical' : 'horizontal'
-            );
-
-            if (best.energy < UNSAFE_ENERGY_THRESHOLD) {
-                physicalCuts.push({ start: best.pos, end: best.pos + rSize });
-            } else {
-                const currentSquish = cellSquishMap.get(cellIdx) || 0;
-                cellSquishMap.set(cellIdx, currentSquish + rSize);
-            }
-        } else {
-            // Not in a cell (gap), just cut it
-            physicalCuts.push(r);
-        }
-    });
-
-    // 2. Generate Breakpoints (Micro-Segments)
-    const boundaries = new Set<number>();
-    boundaries.add(0);
-    boundaries.add(totalSize);
-    
-    physicalCuts.forEach(r => {
-        boundaries.add(r.start);
-        boundaries.add(r.end);
-    });
-
-    cellSquishMap.forEach((_, cellIdx) => {
-        const c = axisCells[cellIdx];
+    // Helper: Identify which cells belong to this strip
+    // Pre-calculating this saves performance in the pixel loop
+    const stripCellsIndices = axisCells.map((c, idx) => {
         if (isVerticalCut) {
-            boundaries.add(Math.max(0, c.y));
-            boundaries.add(Math.min(totalSize, c.y + c.h));
+            const inStrip = (c.x < stripEnd) && (c.x + c.w > stripStart);
+            return inStrip ? idx : -1;
         } else {
-            boundaries.add(Math.max(0, c.x));
-            boundaries.add(Math.min(totalSize, c.x + c.w));
+            const inStrip = (c.y < stripEnd) && (c.y + c.h > stripStart);
+            return inStrip ? idx : -1;
+        }
+    }).filter(i => i !== -1);
+
+    // Helper: Analyze a cell to find which lines are safe
+    const analyzeCellSafety = (cell: Rect) => {
+        const safeLines: number[] = [];
+        const mainStart = isVerticalCut ? cell.y : cell.x;
+        const mainDim = isVerticalCut ? cell.h : cell.w;
+        const blockSize = 2; 
+
+        for(let i = 0; i < mainDim; i += blockSize) {
+            const currentPos = mainStart + i;
+            if (currentPos >= totalSize) break;
+
+            const size = Math.min(blockSize, mainDim - i);
+            const energy = isVerticalCut 
+                ? getRegionEnergy(imgData, imgW, cell.x, currentPos, cell.w, size)
+                : getRegionEnergy(imgData, imgW, currentPos, cell.y, size, cell.h);
+            
+            if (energy < UNSAFE_ENERGY_THRESHOLD) {
+                for(let k=0; k<size; k++) safeLines.push(currentPos + k);
+            }
+        }
+        return safeLines;
+    };
+
+    // 1. Distribute Cuts: Gap vs Cell Quota
+    removeRanges.forEach(range => {
+        for (let i = range.start; i < range.end; i++) {
+            if (i < 0 || i >= totalSize) continue;
+
+            // Check if pixel 'i' falls into any cell in this strip
+            let inCellIdx = -1;
+            for (const cIdx of stripCellsIndices) {
+                const c = axisCells[cIdx];
+                const cStart = isVerticalCut ? c.y : c.x;
+                const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
+                if (i >= cStart && i < cEnd) {
+                    inCellIdx = cIdx;
+                    break;
+                }
+            }
+
+            if (inCellIdx !== -1) {
+                // Pixel is in a cell -> Add to that cell's cut quota
+                const q = cellCutQuota.get(inCellIdx) || 0;
+                cellCutQuota.set(inCellIdx, q + 1);
+            } else {
+                // Pixel is in a gap -> Mark for immediate physical removal
+                pixelAction[i] = 1;
+            }
         }
     });
 
-    const sortedPoints = Array.from(boundaries).sort((a,b) => a - b);
-    const finalOps: DrawOperation[] = [];
+    // 2. Satisfy Cell Quotas (Safe Lines First -> Then Squish)
+    stripCellsIndices.forEach(cellIdx => {
+        const quota = cellCutQuota.get(cellIdx) || 0;
+        if (quota === 0) return;
 
-    // 3. Iterate Segments
-    for (let i = 0; i < sortedPoints.length - 1; i++) {
-        const start = sortedPoints[i];
-        const end = sortedPoints[i+1];
-        const len = end - start;
-        const mid = start + len / 2;
+        const cell = axisCells[cellIdx];
+        
+        // Find safe lines in this cell
+        const safeLines = analyzeCellSafety(cell);
+        
+        // Only use safe lines that aren't already marked for cutting (e.g. by gap logic, though unlikely to overlap)
+        const availableSafeLines = safeLines.filter(pos => pixelAction[pos] === 0);
 
-        if (len <= 0) continue;
+        // Group into contiguous blocks to prioritize larger whitespace chunks
+        const blocks: {start: number, end: number, len: number}[] = [];
+        if (availableSafeLines.length > 0) {
+            let currBlock = { start: availableSafeLines[0], end: availableSafeLines[0] + 1, len: 1 };
+            for(let k=1; k<availableSafeLines.length; k++) {
+                if (availableSafeLines[k] === currBlock.end) {
+                    currBlock.end++;
+                    currBlock.len++;
+                } else {
+                    blocks.push(currBlock);
+                    currBlock = { start: availableSafeLines[k], end: availableSafeLines[k] + 1, len: 1 };
+                }
+            }
+            blocks.push(currBlock);
+        }
+        
+        // Sort blocks by length (largest first)
+        blocks.sort((a,b) => b.len - a.len);
 
-        // Is this segment inside a physical cut? -> Skip it
-        const isCut = physicalCuts.some(cut => mid >= cut.start && mid <= cut.end);
-        if (isCut) continue;
+        let remainingQuota = quota;
 
-        // Is this segment inside a Squish Cell? -> Apply Scale
-        const cellIdx = axisCells.findIndex(c => {
-             // CRITICAL FIX: Must ensure the cell is actually in the current strip
-             // otherwise we might match a cell from a different column/row with same coords.
-             if (isVerticalCut) {
-                 const inStrip = (c.x < stripEnd) && (c.x + c.w > stripStart);
-                 return inStrip && mid >= c.y && mid <= c.y + c.h;
-             } else {
-                 const inStrip = (c.y < stripEnd) && (c.y + c.h > stripStart);
-                 return inStrip && mid >= c.x && mid <= c.x + c.w;
-             }
-        });
-
-        let scale = 1.0;
-        if (cellIdx !== -1 && cellSquishMap.has(cellIdx)) {
-            const squishAmount = cellSquishMap.get(cellIdx)!;
-            const c = axisCells[cellIdx];
-            const originalDim = isVerticalCut ? c.h : c.w;
-            const safeDim = Math.max(originalDim, 1);
-            const targetDim = Math.max(1, safeDim - squishAmount);
-            scale = targetDim / safeDim;
+        // Consume safe lines to satisfy quota
+        for (const block of blocks) {
+            if (remainingQuota <= 0) break;
+            const cutSize = Math.min(remainingQuota, block.len);
+            
+            for(let p = block.start; p < block.start + cutSize; p++) {
+                pixelAction[p] = 1;
+            }
+            remainingQuota -= cutSize;
         }
 
-        finalOps.push({
-            srcStart: start,
-            srcLen: len,
-            destLen: len * scale
-        });
+        // If quota remains, it becomes debt (squish)
+        if (remainingQuota > 0) {
+            const currentDebt = cellSquishDebt.get(cellIdx) || 0;
+            cellSquishDebt.set(cellIdx, currentDebt + remainingQuota);
+        }
+    });
+
+    // 3. Generate Operations based on pixelAction and Squish Debt
+    const ops: DrawOperation[] = [];
+    let currentStart = -1;
+    
+    for (let i = 0; i <= totalSize; i++) {
+        const isCut = i < totalSize ? pixelAction[i] === 1 : true; 
+        
+        if (!isCut) {
+            if (currentStart === -1) currentStart = i;
+        } else {
+            if (currentStart !== -1) {
+                // End of a "Keep" segment
+                const segmentStart = currentStart;
+                const segmentEnd = i;
+                const segmentLen = segmentEnd - segmentStart;
+                
+                let destLen = segmentLen;
+                
+                // Check if this segment belongs to a cell with debt
+                const mid = segmentStart + segmentLen / 2;
+                
+                // Find which cell this segment belongs to
+                let inCellIdx = -1;
+                for (const cIdx of stripCellsIndices) {
+                     const c = axisCells[cIdx];
+                     const cStart = isVerticalCut ? c.y : c.x;
+                     const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
+                     if (mid >= cStart && mid <= cEnd) {
+                         inCellIdx = cIdx;
+                         break;
+                     }
+                }
+
+                if (inCellIdx !== -1 && cellSquishDebt.has(inCellIdx)) {
+                    // Calculate scaling factor
+                    // Scale = (TotalRemainingCellLength - Debt) / TotalRemainingCellLength
+                    let totalRemainingCellLen = 0;
+                    const c = axisCells[inCellIdx];
+                    const cStart = isVerticalCut ? c.y : c.x;
+                    const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
+                    
+                    for(let k=cStart; k<cEnd; k++) {
+                        if (k >= 0 && k < totalSize && pixelAction[k] === 0) {
+                            totalRemainingCellLen++;
+                        }
+                    }
+
+                    if (totalRemainingCellLen > 0) {
+                        const debt = cellSquishDebt.get(inCellIdx)!;
+                        // Prevent scale < 0
+                        const scale = Math.max(0, totalRemainingCellLen - debt) / totalRemainingCellLen;
+                        destLen = segmentLen * scale;
+                    }
+                }
+
+                ops.push({
+                    srcStart: segmentStart,
+                    srcLen: segmentLen,
+                    destLen: destLen
+                });
+                
+                currentStart = -1;
+            }
+        }
     }
 
-    return finalOps;
+    return ops;
 };
 
 const invertRanges = (totalSize: number, removeRanges: {start: number, end: number}[]) => {
@@ -302,6 +333,7 @@ export const processImageCrop = async (
             const globalXRanges = (mode === 'vertical' || mode === 'both') ? mergeRanges(xRanges) : [];
             const globalYRanges = (mode === 'horizontal' || mode === 'both') ? mergeRanges(yRanges) : [];
 
+            // The remove amount equals the total selection size (Physical + Squished)
             const removeW = globalXRanges.reduce((acc, r) => acc + (r.end - r.start), 0);
             const removeH = globalYRanges.reduce((acc, r) => acc + (r.end - r.start), 0);
             const finalW = Math.max(1, item.width - removeW);
