@@ -1,6 +1,6 @@
 
 import React from 'react';
-import { Undo2, Redo2, Download, FoldVertical, FoldHorizontal, Shrink, Eraser } from 'lucide-react';
+import { Undo2, Redo2, Download, FoldVertical, FoldHorizontal, Shrink, Eraser, Sparkles } from 'lucide-react';
 import { CropMode } from '../../../types';
 
 interface ControlPanelProps {
@@ -8,6 +8,8 @@ interface ControlPanelProps {
   historyLength: number;
   hasSelection: boolean;
   isEditingGrid: boolean;
+  smartMode: boolean;
+  onToggleSmartMode: () => void;
   onToggleEraser: () => void;
   onCrop: (mode: CropMode) => void;
   onUndo: () => void;
@@ -16,8 +18,8 @@ interface ControlPanelProps {
 }
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
-  historyIndex, historyLength, hasSelection, isEditingGrid,
-  onToggleEraser, onCrop, onUndo, onRedo, onDownload
+  historyIndex, historyLength, hasSelection, isEditingGrid, smartMode,
+  onToggleSmartMode, onToggleEraser, onCrop, onUndo, onRedo, onDownload
 }) => {
   return (
     <div 
@@ -28,13 +30,13 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
         bg-white dark:bg-slate-900 
         border-t md:border-t-0 md:border-l border-slate-200 dark:border-slate-800 
         flex flex-col z-30 shadow-xl
-        h-[40vh] md:h-full md:max-h-full
+        h-[45vh] md:h-full md:max-h-full
         safe-bottom pointer-events-auto
       "
     >
       <div className="flex-1 overflow-y-auto p-4 md:p-6 min-h-0">
           <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 md:mb-4">工具</h2>
-           <div className="mb-4">
+           <div className="mb-4 space-y-3">
               <button 
                   onClick={onToggleEraser}
                   className={`w-full flex items-center justify-center gap-2 p-3 rounded-xl border transition-all ${isEditingGrid 
@@ -44,8 +46,26 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
                   <Eraser size={18} />
                   <span className="font-medium">{isEditingGrid ? '完成编辑' : '手动擦除表格线'}</span>
               </button>
-              <p className="text-[10px] text-slate-400 mt-1.5 px-1 leading-normal">
-                  滑动擦除多余线条来合并单元格。<br/>按住 Alt 键可删除整行/整列。
+              
+              <div 
+                onClick={onToggleSmartMode}
+                className={`w-full flex items-center justify-between p-3 rounded-xl border cursor-pointer transition-all ${
+                  smartMode 
+                    ? 'bg-brand-50 dark:bg-brand-900/20 border-brand-500/50' 
+                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700'
+                }`}
+              >
+                  <div className="flex items-center gap-2 text-slate-700 dark:text-slate-300">
+                    <Sparkles size={18} className={smartMode ? 'text-brand-500 fill-brand-500/20' : 'text-slate-400'} />
+                    <span className="font-medium text-sm">智能内容避让</span>
+                  </div>
+                  <div className={`w-10 h-6 rounded-full p-1 transition-colors ${smartMode ? 'bg-brand-500' : 'bg-slate-300 dark:bg-slate-600'}`}>
+                    <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${smartMode ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </div>
+              </div>
+
+              <p className="text-[10px] text-slate-400 px-1 leading-normal">
+                 开启智能避让后，当选区穿过单元格时，会自动寻找该列内部的空白区域进行裁剪，保护文字不被截断。
               </p>
            </div>
 
@@ -95,7 +115,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           </div>
       </div>
 
-      <div className="flex-none p-4 md:p-6 bg-slate-50 dark:bg-slate-900/50 border-t border-slate-200 dark:border-slate-800 flex flex-row md:flex-col gap-4 items-center md:items-stretch z-10">
+      <div className="flex-none p-4 md:p-6 bg-slate-50 dark:bg-slate-900/50 border-t border-slate-200 dark:border-slate-800 flex flex-row md:flex-col gap-4 items-center md:items-stretch z-10 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] dark:shadow-none">
           <div className="flex-1">
               <div className="hidden md:block text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-4">历史记录</div>
               <div className="flex gap-2">

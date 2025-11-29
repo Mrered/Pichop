@@ -24,6 +24,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const [isEditingGrid, setIsEditingGrid] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [showToast, setShowToast] = useState(true);
+  const [smartMode, setSmartMode] = useState(true); // Default to Smart Mode
   
   // UI interaction states
   const [hoveredCell, setHoveredCell] = useState<Rect | null>(null);
@@ -75,7 +76,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 });
             }, 100);
         }
-        // setIsEditingGrid(false); // REMOVED: Keep edit mode active after history changes (erasing)
     }
   }, [historyIndex, history]);
 
@@ -94,22 +94,10 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   // --- Helpers ---
   const getPointerCoords = (e: React.MouseEvent | React.TouchEvent) => {
     if (!containerRef.current || historyIndex < 0) return { x: 0, y: 0 };
-    // We need to access the canvas element implicitly or pass ref. 
-    // Since structure separated, we can use container or event target if it's canvas.
-    // For simplicity, let's use the event target bounding rect if it exists, or fallback logic.
-    // However, event bubbling means target might be the container wrapper.
-    // A robust way is finding the canvas in DOM or passing ref from Child. 
-    // Let's assume the event target is the wrapper div which contains the scaled canvas.
-    
-    // Better approach: Calculate relative to the image being displayed.
-    // The visual image is centered and scaled.
-    // Let's implement coordinate translation based on current history item and scale.
     
     const item = history[historyIndex];
     if (!item) return {x:0, y:0};
 
-    // This logic relies on the fact that the pointer events come from the container div
-    // which centers the canvas.
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     
     let clientX, clientY;
@@ -123,18 +111,15 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         return { x: 0, y: 0 };
     }
 
-    // Canvas visual dimensions
     const visualW = item.width * scale;
     const visualH = item.height * scale;
     
-    // Canvas position within container (centered)
     const offsetX = (rect.width - visualW) / 2;
     const offsetY = (rect.height - visualH) / 2;
 
     const relX = clientX - rect.left - offsetX;
     const relY = clientY - rect.top - offsetY;
 
-    // Map to actual image coordinates
     return {
         x: relX / scale,
         y: relY / scale
@@ -146,6 +131,21 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     const item = history[historyIndex];
     const cells = getActualCells(grid, item.width, item.height);
     return cells.find(c => x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) || null;
+  };
+
+  const toggleSelection = (cell: Rect) => {
+    const existsIndex = selections.findIndex(s => 
+        Math.abs(s.x - cell.x) < 1 && 
+        Math.abs(s.y - cell.y) < 1 && 
+        Math.abs(s.w - cell.w) < 1 && 
+        Math.abs(s.h - cell.h) < 1
+    );
+
+    if (existsIndex >= 0) {
+        setSelections(prev => prev.filter((_, i) => i !== existsIndex));
+    } else {
+        setSelections(prev => [...prev, cell]);
+    }
   };
 
   // --- Interaction Handlers ---
@@ -177,13 +177,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     }
 
     if (isEditingGrid && grid) {
-        // Calculate hover segment for visualization
-        // Reuse logic from performErase but just for finding target
-        // For simplicity, we can do a lightweight check or just duplicate logic in a cleaner way.
-        // Let's implement a 'findSegment' helper in gridManipulation if we wanted to be pure.
-        // For now, let's keep it simple: we pass hoveredSegment to canvas.
-        // To avoid code duplication, we'll skip detailed hover calculation here for brevity 
-        // OR implement a basic check.
         const threshold = 20 / scale;
         let bestSeg: EraserHover | null = null;
         let minDest = threshold;
@@ -250,7 +243,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             }
         }
         gridSnapshotRef.current = null;
-        setHoveredSegment(null); // Fix: Clear hover segment to prevent access to deleted lines
+        setHoveredSegment(null); 
         return;
     }
 
@@ -268,18 +261,13 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     setCurrentDrag(null);
   };
 
-  const toggleSelection = (cell: Rect) => {
-    const existsIndex = selections.findIndex(s => 
-        Math.abs(s.x - cell.x) < 1 && Math.abs(s.y - cell.y) < 1 && 
-        Math.abs(s.w - cell.w) < 1 && Math.abs(s.h - cell.h) < 1
-    );
-    if (existsIndex >= 0) setSelections(prev => prev.filter((_, i) => i !== existsIndex));
-    else setSelections(prev => [...prev, cell]);
-  };
-
   // --- Actions ---
   const handleCrop = async (mode: CropMode) => {
-      const res = await processImageCrop(history[historyIndex], selections, grid, mode);
+      if (selections.length === 0 || historyIndex < 0) return;
+      
+      // Use the external processor
+      const res = await processImageCrop(history[historyIndex], selections, grid, mode, smartMode);
+      
       if (res) {
           const newHistory = history.slice(0, historyIndex + 1);
           newHistory.push(res);
@@ -303,8 +291,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     <div className="flex flex-col md:flex-row h-full w-full relative">
       <div 
         ref={containerRef}
-        className="flex-1 relative overflow-hidden" 
-        style={{ touchAction: 'none' }} // Prevent scrolling
+        className="flex-1 relative overflow-hidden flex flex-col w-full min-h-0" 
+        style={{ touchAction: 'none' }}
       >
         {currentItem && (
             <CanvasView 
@@ -342,6 +330,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
           historyLength={history.length}
           hasSelection={selections.length > 0}
           isEditingGrid={isEditingGrid}
+          smartMode={smartMode}
+          onToggleSmartMode={() => setSmartMode(!smartMode)}
           onToggleEraser={() => { setIsEditingGrid(!isEditingGrid); setSelections([]); }}
           onCrop={handleCrop}
           onUndo={() => { setHistoryIndex(i => i - 1); setSelections([]); }}

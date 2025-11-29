@@ -29,6 +29,10 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
   const animationRef = useRef(0);
 
   useEffect(() => {
+    // Create image once when src changes
+    const img = new Image();
+    img.src = imageSrc;
+
     const render = () => {
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -41,17 +45,14 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
             canvas.height = height;
         }
 
-        const img = new Image();
-        img.src = imageSrc;
-
-        if (!img.complete) {
-            img.onload = () => requestAnimationFrame(render);
-            return;
+        // Only draw if loaded
+        if (img.complete) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, width, height);
+        } else {
+            // Retry if not loaded
+            img.onload = () => render();
         }
-
-        // Draw Image
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0);
 
         // Draw Grid
         if (grid) {
@@ -206,7 +207,7 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
 
   return (
     <div 
-        className={`flex-1 bg-slate-100 dark:bg-slate-950 overflow-hidden flex items-center justify-center p-4 md:p-8 relative select-none touch-none ${isEditingGrid ? 'cursor-cell' : 'cursor-crosshair'}`}
+        className={`flex-1 bg-slate-100 dark:bg-slate-950 overflow-hidden flex items-center justify-center p-4 md:p-8 relative select-none touch-none w-full h-full min-h-0 ${isEditingGrid ? 'cursor-cell' : 'cursor-crosshair'}`}
         onMouseDown={onPointerDown}
         onMouseMove={onPointerMove}
         onMouseUp={onPointerUp}

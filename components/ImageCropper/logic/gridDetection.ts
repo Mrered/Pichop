@@ -1,4 +1,3 @@
-
 import { HistoryItem, Grid, GridLine } from '../../../types';
 import { Segment } from '../types';
 
@@ -21,10 +20,11 @@ export const detectGrid = (
 
     const getLum = (idx: number) => (data[idx] + data[idx+1] + data[idx+2]);
     
-    const CONTRAST_THRESH = 40;
-    const MIN_SEG_LEN = Math.max(16, Math.min(width, height) * 0.01);
-    const GAP_TOLERANCE = 4;
-    const POS_TOLERANCE = 3;
+    // Lower contrast threshold for better sensitivity on light lines
+    const CONTRAST_THRESH = 45;
+    const MIN_SEG_LEN = Math.max(32, Math.min(width, height) * 0.02);
+    const GAP_TOLERANCE = 10;
+    const POS_TOLERANCE = 5;
 
     // --- Horizontal Scan ---
     const rawH: Segment[] = [];
@@ -140,7 +140,7 @@ export const detectGrid = (
         pos: x, thickness: 1, start: 0, end: height
     }));
     
-    // Add Borders
+    // Ensure strict boundary lines
     if (finalH.length === 0 || finalH[0].pos > 5) finalH.unshift({ pos: 0, thickness: 0, start: 0, end: width });
     if (finalH.length > 0 && finalH[finalH.length-1].pos < height - 5) finalH.push({ pos: height, thickness: 0, start: 0, end: width });
 

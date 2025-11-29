@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ImageCropper } from './components/ImageCropper';
+import { ImageCropper } from './components/ImageCropper/index';
 import { UploadScreen } from './components/UploadScreen';
 import { Scissors } from 'lucide-react';
 
