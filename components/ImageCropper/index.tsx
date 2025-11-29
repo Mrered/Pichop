@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Rect, HistoryItem, CropMode, Grid } from '../../types';
 import { detectGrid } from './logic/gridDetection';
@@ -177,7 +178,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     }
 
     if (isEditingGrid && grid) {
-        const threshold = 20 / scale;
+        // MATCHED THRESHOLD: 6/scale to match performErase.
+        const threshold = 6 / scale;
         let bestSeg: EraserHover | null = null;
         let minDest = threshold;
         const isWholeLine = e.altKey || e.metaKey;

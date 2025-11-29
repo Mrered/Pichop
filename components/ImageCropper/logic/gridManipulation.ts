@@ -9,7 +9,10 @@ export const performErase = (
 ): Grid | null => {
     if (!grid) return null;
     const newGrid = { ...grid };
-    const threshold = 20 / scale; // User friendly threshold
+    
+    // REDUCED THRESHOLD: Was 20/scale, now 6/scale.
+    // This makes the eraser much more precise, only affecting lines strictly under the pointer.
+    const threshold = 6 / scale; 
 
     const processLines = (lines: GridLine[], type: 'h'|'v') => {
         const res: GridLine[] = [];
