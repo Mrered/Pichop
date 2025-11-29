@@ -1,0 +1,5 @@
+{
+  "name": "Smart Slice - Image Gap Remover",
+  "description": "An intelligent image editing tool designed to remove horizontal or vertical sections from images, perfect for cleaning up screenshots of tables or long documents.",
+  "requestFramePermissions": []
+}
