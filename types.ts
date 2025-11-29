@@ -23,4 +23,5 @@ export interface HistoryItem {
   dataUrl: string;
   width: number;
   height: number;
+  grid?: Grid; // Persist grid state across history
 }

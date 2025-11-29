@@ -12,7 +12,8 @@ import {
   Scan,
   Smartphone,
   Trash2,
-  Grid3X3
+  Grid3X3,
+  Eraser
 } from 'lucide-react';
 import { Rect, HistoryItem, CropMode, Grid, GridLine } from '../types';
 
@@ -20,10 +21,9 @@ interface ImageCropperProps {
   initialImage: string;
 }
 
-// Internal types for the algorithm
 interface Segment {
   id: number;
-  pos: number; // y for horiz, x for vert
+  pos: number;
   start: number;
   end: number;
   length: number;
@@ -39,6 +39,16 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const [selections, setSelections] = useState<Rect[]>([]);
   const [currentDrag, setCurrentDrag] = useState<Rect | null>(null);
   const [grid, setGrid] = useState<Grid | null>(null);
+  const [isEditingGrid, setIsEditingGrid] = useState(false);
+  
+  // Eraser State
+  const [hoveredSegment, setHoveredSegment] = useState<{ 
+    type: 'horizontal' | 'vertical', 
+    lineIndex: number, 
+    start: number, 
+    end: number,
+    isWholeLine: boolean 
+  } | null>(null);
   
   // UI States
   const [isDragging, setIsDragging] = useState(false);
@@ -72,6 +82,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
       setHistoryIndex(0);
       setSelections([]);
       setGrid(null);
+      setIsEditingGrid(false);
       
       handleFitScreen(img.width, img.height);
     };
@@ -80,20 +91,26 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     return () => clearTimeout(timer);
   }, [initialImage]);
 
-  // --- History Change Effect (Re-scan) ---
+  // --- History Change Effect ---
   useEffect(() => {
     if (historyIndex >= 0 && history[historyIndex]) {
-        setGrid(null); 
-        startScanning(history[historyIndex]);
+        const item = history[historyIndex];
+        // If the history item already has a grid (calculated from previous step), use it.
+        // Otherwise, scan for a new one.
+        if (item.grid) {
+            setGrid(item.grid);
+            setIsScanning(false);
+        } else {
+            setGrid(null); 
+            startScanning(item);
+        }
+        setIsEditingGrid(false);
     }
   }, [historyIndex, history]);
 
-  // --- Smart Grid Detection ---
   const startScanning = (item: HistoryItem) => {
     setIsScanning(true);
     scanProgressRef.current = 0;
-    
-    // Slight delay to allow UI to render the "scanning" state before the heavy lifting
     setTimeout(() => {
       detectGrid(item);
     }, 100);
@@ -113,22 +130,15 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const { data, width, height } = imageData;
 
-      // --- ALGORITHM: Connected Component Grid Detection ---
+      const getLum = (idx: number) => (data[idx] + data[idx+1] + data[idx+2]);
       
-      const getLum = (idx: number) => (data[idx] + data[idx+1] + data[idx+2]); // Sum (0-765)
-      
-      const CONTRAST_THRESH = 40; // Detection sensitivity
-      const MIN_SEG_LEN = Math.max(16, Math.min(width, height) * 0.01); // 1% or 16px min length
-      const GAP_TOLERANCE = 4; // px
-      const POS_TOLERANCE = 3; // px (fuzzy alignment)
+      const CONTRAST_THRESH = 40;
+      const MIN_SEG_LEN = Math.max(16, Math.min(width, height) * 0.01);
+      const GAP_TOLERANCE = 4;
+      const POS_TOLERANCE = 3;
 
-      // 1. Extract Raw Segments
-      // We scan for continuous runs of "edges".
-      
       const rawH: Segment[] = [];
       let hId = 0;
-      
-      // Horizontal Scan
       for (let y = 1; y < height - 1; y++) {
           let startX = -1;
           for (let x = 0; x < width; x++) {
@@ -157,8 +167,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
 
       const rawV: Segment[] = [];
       let vId = 0;
-      
-      // Vertical Scan
       for (let x = 1; x < width - 1; x++) {
           let startY = -1;
           for (let y = 0; y < height; y++) {
@@ -185,7 +193,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
           }
       }
 
-      // 2. Cluster & Merge Segments (Fuzzy Grouping)
       const clusterSegments = (items: Segment[], posKey: 'pos', startKey: 'start', endKey: 'end') => {
           items.sort((a, b) => a[posKey] - b[posKey]);
           const merged: Segment[] = [];
@@ -194,16 +201,13 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
           if (items.length > 0) currentGroup.push(items[0]);
 
           const processGroup = (group: Segment[]) => {
-               // Average position
                const avgPos = Math.round(group.reduce((acc, i) => acc + i[posKey], 0) / group.length);
-               // Sort by start
                group.sort((a, b) => a[startKey] - b[startKey]);
                
                let curr = { ...group[0], pos: avgPos };
                for (let i = 1; i < group.length; i++) {
                    const next = group[i];
                    if (next[startKey] <= curr[endKey] + GAP_TOLERANCE) {
-                       // Overlap or close -> Merge
                        curr[endKey] = Math.max(curr[endKey], next[endKey]);
                        curr.length = curr[endKey] - curr[startKey];
                    } else {
@@ -225,43 +229,31 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
               }
           }
           if (currentGroup.length > 0) processGroup(currentGroup);
-          
-          // Re-assign IDs uniquely
           return merged.map((m, i) => ({ ...m, id: i }));
       };
 
       const hSegments = clusterSegments(rawH, 'pos', 'start', 'end');
       const vSegments = clusterSegments(rawV, 'pos', 'start', 'end');
 
-      // 3. Build Connectivity Graph
-      // Intersect every H with every V
-      const adj = new Map<string, string[]>(); // Key: "h-1", Val: ["v-2", "v-5"]
-      
+      const adj = new Map<string, string[]>(); 
       const getNodeKey = (type: 'h'|'v', id: number) => `${type}-${id}`;
 
       hSegments.forEach(h => {
           vSegments.forEach(v => {
-              // Intersection Check
-              // H is at y=h.pos, spans x[h.start, h.end]
-              // V is at x=v.pos, spans y[v.start, v.end]
-              
               const h_intersects_v_x = v.pos >= h.start - POS_TOLERANCE && v.pos <= h.end + POS_TOLERANCE;
               const v_intersects_h_y = h.pos >= v.start - POS_TOLERANCE && h.pos <= v.end + POS_TOLERANCE;
 
               if (h_intersects_v_x && v_intersects_h_y) {
                   const hKey = getNodeKey('h', h.id);
                   const vKey = getNodeKey('v', v.id);
-                  
                   if (!adj.has(hKey)) adj.set(hKey, []);
                   if (!adj.has(vKey)) adj.set(vKey, []);
-                  
                   adj.get(hKey)!.push(vKey);
                   adj.get(vKey)!.push(hKey);
               }
           });
       });
 
-      // 4. Find Connected Components
       const visited = new Set<string>();
       const components: { totalLength: number, hSegs: Segment[], vSegs: Segment[] }[] = [];
 
@@ -272,7 +264,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
 
       allNodes.forEach(node => {
           if (!visited.has(node.key) && adj.has(node.key)) {
-              // Start BFS/DFS
               const componentHSegs: Segment[] = [];
               const componentVSegs: Segment[] = [];
               let componentLength = 0;
@@ -284,11 +275,9 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                   const currKey = queue.shift()!;
                   const isH = currKey.startsWith('h');
                   const id = parseInt(currKey.split('-')[1]);
-                  
                   const seg = isH ? hSegments[id] : vSegments[id];
                   if (isH) componentHSegs.push(seg);
                   else componentVSegs.push(seg);
-                  
                   componentLength += seg.length;
 
                   const neighbors = adj.get(currKey) || [];
@@ -308,47 +297,43 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
           }
       });
 
-      // 5. Select Best Component (Largest Table)
       if (components.length === 0) {
           setGrid(null);
           setIsScanning(false);
           return;
       }
 
-      // Sort by mass (total length of connected lines)
       components.sort((a, b) => b.totalLength - a.totalLength);
       const best = components[0];
 
-      // If the best component is too small (e.g. noise), discard
       if (best.totalLength < (width + height) * 0.5) {
            setGrid(null);
            setIsScanning(false);
            return;
       }
 
-      // 6. Project to Infinite Cuts
-      // We extract unique positions from the best component.
-      // This enforces "Infinite Cutting Plane": if a segment exists in the table structure, it cuts the whole image.
       const uniqueY = new Set<number>();
       best.hSegs.forEach(s => uniqueY.add(s.pos));
-      
       const uniqueX = new Set<number>();
       best.vSegs.forEach(s => uniqueX.add(s.pos));
 
-      // Final Grid Lines
+      // Initially, detection creates full lines. User will split them.
       const finalH: GridLine[] = Array.from(uniqueY).sort((a,b)=>a-b).map(y => ({
-          pos: y, thickness: 1, start: 0, end: 0
+          pos: y, thickness: 1, start: 0, end: width // Full width initially
       }));
       const finalV: GridLine[] = Array.from(uniqueX).sort((a,b)=>a-b).map(x => ({
-          pos: x, thickness: 1, start: 0, end: 0
+          pos: x, thickness: 1, start: 0, end: height // Full height initially
       }));
       
-      // Ensure edges are present if close
-      // (Optional: sometimes user wants to crop edges, sometimes not. Let's leave strict detection).
+      // Boundaries
+      if (finalH.length === 0 || finalH[0].pos > 5) finalH.unshift({ pos: 0, thickness: 0, start: 0, end: width });
+      if (finalH.length > 0 && finalH[finalH.length-1].pos < height - 5) finalH.push({ pos: height, thickness: 0, start: 0, end: width });
+
+      if (finalV.length === 0 || finalV[0].pos > 5) finalV.unshift({ pos: 0, thickness: 0, start: 0, end: height });
+      if (finalV.length > 0 && finalV[finalV.length-1].pos < width - 5) finalV.push({ pos: width, thickness: 0, start: 0, end: height });
 
       setGrid({ horizontal: finalH, vertical: finalV });
       
-      // Animation cleanup
       setTimeout(() => setIsScanning(false), 600);
     };
   };
@@ -358,7 +343,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         const { clientWidth, clientHeight } = containerRef.current;
         const currentW = imgW || (history[historyIndex]?.width ?? 1000);
         const currentH = imgH || (history[historyIndex]?.height ?? 1000);
-        
         const padding = 32; 
         const scaleX = (clientWidth - padding) / currentW;
         const scaleY = (clientHeight - padding) / currentH;
@@ -366,38 +350,102 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     }
   }, [history, historyIndex]);
 
-  // --- Interaction Logic ---
-  
+  // --- Graph Traversal for "Merged Cell" Logic ---
+  // Returns list of Rects representing actual cells (merged or not)
+  const getActualCells = (grid: Grid, w: number, h: number): Rect[] => {
+      // 1. Build atomic blocks (Lattice)
+      const ys = Array.from(new Set(grid.horizontal.map(l => l.pos).concat([0, h]))).sort((a,b)=>a-b);
+      const xs = Array.from(new Set(grid.vertical.map(l => l.pos).concat([0, w]))).sort((a,b)=>a-b);
+
+      // Unique deduplication
+      const u_ys = ys.filter((v, i) => i === 0 || v > ys[i-1] + 1);
+      const u_xs = xs.filter((v, i) => i === 0 || v > xs[i-1] + 1);
+
+      const visited = new Set<string>();
+      const cells: Rect[] = [];
+
+      for (let r = 0; r < u_ys.length - 1; r++) {
+          for (let c = 0; c < u_xs.length - 1; c++) {
+              const key = `${c}-${r}`;
+              if (visited.has(key)) continue;
+
+              // BFS to find connected component (Flood Fill)
+              let minX = u_xs[c], maxX = u_xs[c+1];
+              let minY = u_ys[r], maxY = u_ys[r+1];
+              
+              const queue = [{c, r}];
+              visited.add(key);
+
+              while(queue.length > 0) {
+                  const curr = queue.shift()!;
+                  
+                  const cx1 = u_xs[curr.c], cx2 = u_xs[curr.c+1];
+                  const cy1 = u_ys[curr.r], cy2 = u_ys[curr.r+1];
+                  
+                  minX = Math.min(minX, cx1); maxX = Math.max(maxX, cx2);
+                  minY = Math.min(minY, cy1); maxY = Math.max(maxY, cy2);
+
+                  // Check neighbors
+                  const neighbors = [
+                      { dc: 1, dr: 0, wallType: 'v', wallPos: cx2, wallStart: cy1, wallEnd: cy2 }, // Right
+                      { dc: -1, dr: 0, wallType: 'v', wallPos: cx1, wallStart: cy1, wallEnd: cy2 }, // Left
+                      { dc: 0, dr: 1, wallType: 'h', wallPos: cy2, wallStart: cx1, wallEnd: cx2 }, // Down
+                      { dc: 0, dr: -1, wallType: 'h', wallPos: cy1, wallStart: cx1, wallEnd: cx2 } // Up
+                  ];
+
+                  for (const n of neighbors) {
+                      const nc = curr.c + n.dc;
+                      const nr = curr.r + n.dr;
+                      
+                      // Bounds check
+                      if (nc < 0 || nc >= u_xs.length - 1 || nr < 0 || nr >= u_ys.length - 1) continue;
+                      
+                      const nKey = `${nc}-${nr}`;
+                      if (visited.has(nKey)) continue;
+
+                      // Check for wall
+                      let hasWall = false;
+                      const lines = n.wallType === 'v' ? grid.vertical : grid.horizontal;
+                      
+                      // Find if ANY segment of the line blocks this transition
+                      for(const line of lines) {
+                          if (Math.abs(line.pos - n.wallPos) < 2) {
+                              // Check segment overlap
+                              const overlapStart = Math.max(line.start, n.wallStart);
+                              const overlapEnd = Math.min(line.end, n.wallEnd);
+                              if (overlapStart < overlapEnd - 1) { // 1px tolerance
+                                  hasWall = true;
+                                  break;
+                              }
+                          }
+                      }
+
+                      if (!hasWall) {
+                          visited.add(nKey);
+                          queue.push({c: nc, r: nr});
+                      }
+                  }
+              }
+
+              cells.push({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
+          }
+      }
+      return cells;
+  };
+
   const getCellAt = (x: number, y: number): Rect | null => {
     if (!grid) return null;
-    
-    // Find closest lines surrounding the point
-    let y1 = -Infinity, y2 = Infinity;
-    for (const line of grid.horizontal) {
-        if (line.pos <= y && line.pos > y1) y1 = line.pos;
-        if (line.pos > y && line.pos < y2) y2 = line.pos;
-    }
-
-    let x1 = -Infinity, x2 = Infinity;
-    for (const line of grid.vertical) {
-        if (line.pos <= x && line.pos > x1) x1 = line.pos;
-        if (line.pos > x && line.pos < x2) x2 = line.pos;
-    }
-
-    if (y1 === -Infinity || y2 === Infinity || x1 === -Infinity || x2 === Infinity) return null;
-
-    const w = x2 - x1;
-    const h = y2 - y1;
-
-    if (w < 4 || h < 4) return null;
-
-    return { x: x1, y: y1, w, h };
+    const item = history[historyIndex];
+    const cells = getActualCells(grid, item.width, item.height);
+    return cells.find(c => 
+        x >= c.x && x <= c.x + c.w && 
+        y >= c.y && y <= c.y + c.h
+    ) || null;
   };
 
   const getPointerCoords = (e: React.MouseEvent | React.TouchEvent | MouseEvent | TouchEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return { x: 0, y: 0 };
-    
     let clientX, clientY;
     if ('touches' in e && e.touches.length > 0) {
         clientX = e.touches[0].clientX;
@@ -408,7 +456,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     } else {
         return { x: 0, y: 0 };
     }
-
     const rect = canvas.getBoundingClientRect();
     const x = (clientX - rect.left) / (rect.width / canvas.width);
     const y = (clientY - rect.top) / (rect.height / canvas.height);
@@ -416,7 +463,52 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   };
 
   const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
+    e.stopPropagation();
     if ('touches' in e && e.touches.length > 1) return; 
+
+    // --- Eraser Mode Logic ---
+    if (isEditingGrid && grid && hoveredSegment) {
+        setGrid(prev => {
+            if (!prev) return null;
+            const newGrid = { ...prev };
+            
+            const targetArray = hoveredSegment.type === 'horizontal' ? newGrid.horizontal : newGrid.vertical;
+            const originalLine = targetArray[hoveredSegment.lineIndex];
+            
+            // Remove the original line
+            targetArray.splice(hoveredSegment.lineIndex, 1);
+
+            if (hoveredSegment.isWholeLine) {
+                 // Deleting whole line: Do nothing (just splice above)
+            } else {
+                 // Deleting segment: Split into two lines (gaps)
+                 // Part 1: Start to SegmentStart
+                 if (hoveredSegment.start > originalLine.start + 1) {
+                     targetArray.push({ 
+                         pos: originalLine.pos, 
+                         thickness: originalLine.thickness, 
+                         start: originalLine.start, 
+                         end: hoveredSegment.start 
+                     });
+                 }
+                 // Part 2: SegmentEnd to End
+                 if (hoveredSegment.end < originalLine.end - 1) {
+                     targetArray.push({ 
+                         pos: originalLine.pos, 
+                         thickness: originalLine.thickness, 
+                         start: hoveredSegment.end, 
+                         end: originalLine.end 
+                     });
+                 }
+            }
+            return newGrid;
+        });
+        setHoveredSegment(null); 
+        return;
+    }
+
+    if (isEditingGrid) return;
+
     const coords = getPointerCoords(e);
     setDragStart(coords);
     setIsDragging(true);
@@ -425,6 +517,68 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
 
   const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
     const coords = getPointerCoords(e);
+
+    // --- Eraser Mode Highlight ---
+    if (isEditingGrid && grid) {
+        const threshold = 20 / scale;
+        let bestSeg = null;
+        let minDest = threshold;
+        const isWholeLine = e.altKey || e.metaKey; // Modifier key for whole line
+
+        const checkLines = (type: 'horizontal' | 'vertical') => {
+            const lines = type === 'horizontal' ? grid.horizontal : grid.vertical;
+            const perpLines = type === 'horizontal' ? grid.vertical : grid.horizontal;
+            
+            const coordMain = type === 'horizontal' ? coords.y : coords.x;
+            const coordCross = type === 'horizontal' ? coords.x : coords.y;
+
+            lines.forEach((l, i) => {
+                // Check if cursor is within line range
+                if (coordCross < l.start || coordCross > l.end) return;
+
+                const dist = Math.abs(coordMain - l.pos);
+                if (dist < minDest) {
+                    // Find segment
+                    let segStart = l.start;
+                    let segEnd = l.end;
+
+                    // Find closest perpendiculars
+                    // Filter perps that actually cross this line
+                    const crossings = perpLines
+                        .filter(p => p.start <= l.pos && p.end >= l.pos)
+                        .map(p => p.pos)
+                        .sort((a,b) => a-b);
+                    
+                    // Find bracket around cursor
+                    for (const cp of crossings) {
+                        if (cp <= coordCross) segStart = Math.max(segStart, cp);
+                        else if (cp > coordCross) {
+                            segEnd = Math.min(segEnd, cp);
+                            break;
+                        }
+                    }
+
+                    minDest = dist;
+                    bestSeg = { 
+                        type, 
+                        lineIndex: i, 
+                        start: segStart, 
+                        end: segEnd,
+                        isWholeLine: isWholeLine 
+                    };
+                }
+            });
+        };
+
+        checkLines('horizontal');
+        checkLines('vertical');
+        
+        setHoveredSegment(bestSeg);
+        setHoveredCell(null);
+        return;
+    } else {
+        setHoveredSegment(null);
+    }
 
     if (!isDragging && grid) {
         const cell = getCellAt(coords.x, coords.y);
@@ -446,15 +600,15 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const handlePointerUp = (e: React.MouseEvent | React.TouchEvent) => {
     setIsDragging(false);
     
+    if (isEditingGrid) return;
+    
     if (currentDrag) {
-        // Distinguish click from drag
         if (Math.abs(currentDrag.w) < 5 && Math.abs(currentDrag.h) < 5) {
              const cell = getCellAt(currentDrag.x, currentDrag.y);
              if (cell) {
                  toggleSelection(cell);
              } 
         } else {
-            // Drag selection
             let { x, y, w, h } = currentDrag;
             if (w < 0) { x += w; w = Math.abs(w); }
             if (h < 0) { y += h; h = Math.abs(h); }
@@ -505,42 +659,80 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             return;
         }
 
-        // 1. Draw Image
+        // Draw Image
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, 0, 0);
 
-        // 2. Draw Grid Lines
+        // Draw Grid Lines
         if (grid) {
             ctx.save();
             ctx.lineWidth = 1 / scale;
-            const alpha = isScanning ? 0.6 : 0.2; 
+            const alpha = isScanning ? 0.6 : (isEditingGrid ? 0.4 : 0.2); 
             ctx.strokeStyle = `rgba(56, 189, 248, ${alpha})`;
             
-            ctx.beginPath();
-            grid.horizontal.forEach(l => {
-                if(l.pos > 0 && l.pos < canvas.height) {
-                    ctx.moveTo(0, l.pos);
-                    ctx.lineTo(canvas.width, l.pos);
+            // Function to draw lines
+            const drawLines = (lines: GridLine[], type: 'h' | 'v') => {
+                 lines.forEach((l, i) => {
+                    // Skip if currently hovering this segment (we'll draw it red)
+                    if (isEditingGrid && hoveredSegment && hoveredSegment.type === (type==='h'?'horizontal':'vertical') && hoveredSegment.lineIndex === i && hoveredSegment.isWholeLine) {
+                         return; 
+                    }
+                    
+                    ctx.beginPath();
+                    if (type === 'h') {
+                        ctx.moveTo(l.start, l.pos);
+                        ctx.lineTo(l.end, l.pos);
+                    } else {
+                        ctx.moveTo(l.pos, l.start);
+                        ctx.lineTo(l.pos, l.end);
+                    }
+                    ctx.stroke();
+                 });
+            };
+
+            drawLines(grid.horizontal, 'h');
+            drawLines(grid.vertical, 'v');
+
+            // Highlight Hovered Segment (Eraser Mode)
+            if (isEditingGrid && hoveredSegment) {
+                ctx.beginPath();
+                ctx.strokeStyle = '#ef4444';
+                ctx.lineWidth = 3 / scale;
+                ctx.shadowColor = '#ef4444';
+                ctx.shadowBlur = 5;
+                
+                if (hoveredSegment.type === 'horizontal') {
+                    const y = grid.horizontal[hoveredSegment.lineIndex].pos;
+                    if (hoveredSegment.isWholeLine) {
+                         ctx.moveTo(grid.horizontal[hoveredSegment.lineIndex].start, y);
+                         ctx.lineTo(grid.horizontal[hoveredSegment.lineIndex].end, y);
+                    } else {
+                         ctx.moveTo(hoveredSegment.start, y);
+                         ctx.lineTo(hoveredSegment.end, y);
+                    }
+                } else {
+                    const x = grid.vertical[hoveredSegment.lineIndex].pos;
+                     if (hoveredSegment.isWholeLine) {
+                         ctx.moveTo(x, grid.vertical[hoveredSegment.lineIndex].start);
+                         ctx.lineTo(x, grid.vertical[hoveredSegment.lineIndex].end);
+                    } else {
+                        ctx.moveTo(x, hoveredSegment.start);
+                        ctx.lineTo(x, hoveredSegment.end);
+                    }
                 }
-            });
-            grid.vertical.forEach(l => {
-                 if(l.pos > 0 && l.pos < canvas.width) {
-                    ctx.moveTo(l.pos, 0);
-                    ctx.lineTo(l.pos, canvas.height);
-                 }
-            });
-            ctx.stroke();
+                ctx.stroke();
+            }
+
             ctx.restore();
         }
 
-        // 3. Scan Animation (Cyberpunk / Sci-fi Style)
+        // Scan Animation
         if (isScanning) {
             ctx.save();
             scanProgressRef.current = (scanProgressRef.current + 25) % (canvas.height + 300);
             const scanY = scanProgressRef.current - 150;
             
             if (scanY < canvas.height + 50) {
-                // Gradient trail
                 const gradient = ctx.createLinearGradient(0, scanY - 100, 0, scanY);
                 gradient.addColorStop(0, 'rgba(14, 165, 233, 0)');
                 gradient.addColorStop(1, 'rgba(56, 189, 248, 0.25)');
@@ -548,7 +740,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 ctx.fillStyle = gradient;
                 ctx.fillRect(0, scanY - 100, canvas.width, 100);
                 
-                // Bright Scan Line
                 ctx.beginPath();
                 ctx.moveTo(0, scanY);
                 ctx.lineTo(canvas.width, scanY);
@@ -559,12 +750,11 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 ctx.stroke();
             }
             ctx.restore();
-
             animationFrameRef.current = requestAnimationFrame(render);
         }
 
-        // 4. Hover Effect
-        if (hoveredCell && !isDragging) {
+        // Hover Effect (Normal Mode)
+        if (hoveredCell && !isDragging && !isEditingGrid) {
             ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
             ctx.strokeStyle = 'rgba(14, 165, 233, 0.9)';
             ctx.lineWidth = 2 / scale;
@@ -572,7 +762,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             ctx.strokeRect(hoveredCell.x, hoveredCell.y, hoveredCell.w, hoveredCell.h);
         }
 
-        // 5. Selections
+        // Selections
         selections.forEach(s => {
             let rx = s.x;
             let ry = s.y;
@@ -587,7 +777,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             ctx.lineWidth = 2 / scale;
             ctx.strokeRect(rx, ry, rw, rh);
             
-            // X mark for deletion
             if (rw > 12 && rh > 12) {
                 ctx.beginPath();
                 ctx.moveTo(rx, ry);
@@ -600,7 +789,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             }
         });
 
-        // 6. Manual Drag Box
+        // Manual Drag Box
         if (currentDrag && (Math.abs(currentDrag.w) > 2 || Math.abs(currentDrag.h) > 2)) {
             let rx = currentDrag.x;
             let ry = currentDrag.y;
@@ -621,10 +810,10 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
 
     render();
     return () => cancelAnimationFrame(animationFrameRef.current);
-  }, [history, historyIndex, selections, currentDrag, grid, isScanning, scale, hoveredCell]);
+  }, [history, historyIndex, selections, currentDrag, grid, isScanning, scale, hoveredCell, isEditingGrid, hoveredSegment]);
 
 
-  // --- Stitching Logic (Unchanged) ---
+  // --- Stitching Logic ---
   const performCrop = (mode: CropMode) => {
     if (selections.length === 0 || historyIndex < 0) return;
     
@@ -634,42 +823,23 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     
     img.onload = () => {
         const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (!ctx) return;
 
+        ctx.drawImage(img, 0, 0);
+        const fullImageData = ctx.getImageData(0, 0, img.width, img.height);
+        
+        // 1. Calculate Ranges
         let xRanges: {start: number, end: number}[] = [];
         let yRanges: {start: number, end: number}[] = [];
 
+        // Simple unsnapped ranges for initial calculation
         selections.forEach(s => {
             let rx = s.x, ry = s.y, rw = s.w, rh = s.h;
             if (rw < 0) { rx += rw; rw = Math.abs(rw); }
             if (rh < 0) { ry += rh; rh = Math.abs(rh); }
-            
-            if (grid) {
-                const snap = (val: number, lines: GridLine[]) => {
-                    let nearest = val;
-                    let minDist = 6; // Snapping tolerance
-                    lines.forEach(l => {
-                        const dist = Math.abs(l.pos - val);
-                        if (dist < minDist) {
-                            minDist = dist;
-                            nearest = l.pos;
-                        }
-                    });
-                    return nearest;
-                };
-
-                const startY = snap(ry, grid.horizontal);
-                const endY = snap(ry + rh, grid.horizontal);
-                const startX = snap(rx, grid.vertical);
-                const endX = snap(rx + rw, grid.vertical);
-                
-                yRanges.push({ start: startY, end: endY });
-                xRanges.push({ start: startX, end: endX });
-            } else {
-                yRanges.push({ start: ry, end: ry + rh });
-                xRanges.push({ start: rx, end: rx + rw });
-            }
+            yRanges.push({ start: ry, end: ry + rh });
+            xRanges.push({ start: rx, end: rx + rw });
         });
 
         const mergeRanges = (ranges: {start: number, end: number}[]) => {
@@ -679,11 +849,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             for (let i = 1; i < ranges.length; i++) {
                 const prev = merged[merged.length - 1];
                 const curr = ranges[i];
-                if (curr.start < prev.end + 1) { 
-                    prev.end = Math.max(prev.end, curr.end);
-                } else {
-                    merged.push(curr);
-                }
+                if (curr.start < prev.end + 1) prev.end = Math.max(prev.end, curr.end);
+                else merged.push(curr);
             }
             return merged;
         };
@@ -691,6 +858,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         const finalXRanges = (mode === 'vertical' || mode === 'both') ? mergeRanges(xRanges) : [];
         const finalYRanges = (mode === 'horizontal' || mode === 'both') ? mergeRanges(yRanges) : [];
 
+        // 2. Stitch Background
         let removeW = finalXRanges.reduce((acc, r) => acc + (r.end - r.start), 0);
         let removeH = finalYRanges.reduce((acc, r) => acc + (r.end - r.start), 0);
         
@@ -699,19 +867,34 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
 
         canvas.width = newW;
         canvas.height = newH;
+        const resCtx = canvas.getContext('2d', { willReadFrequently: true });
+        if(!resCtx) return;
+
+        const mapX = (x: number) => {
+            let shift = 0;
+            for(const r of finalXRanges) {
+                if (x >= r.end) shift += (r.end - r.start);
+                else if (x > r.start) shift += (x - r.start);
+            }
+            return x - shift;
+        };
+        const mapY = (y: number) => {
+            let shift = 0;
+            for(const r of finalYRanges) {
+                if (y >= r.end) shift += (r.end - r.start);
+                else if (y > r.start) shift += (y - r.start);
+            }
+            return y - shift;
+        };
 
         const getKeepRanges = (totalSize: number, removeRanges: {start: number, end: number}[]) => {
             const keep = [];
             let cursor = 0;
             removeRanges.forEach(r => {
-                if (r.start > cursor) {
-                    keep.push({ start: cursor, end: r.start });
-                }
+                if (r.start > cursor) keep.push({ start: cursor, end: r.start });
                 cursor = Math.max(cursor, r.end);
             });
-            if (cursor < totalSize) {
-                keep.push({ start: cursor, end: totalSize });
-            }
+            if (cursor < totalSize) keep.push({ start: cursor, end: totalSize });
             return keep;
         };
 
@@ -725,19 +908,143 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             keepX.forEach(kx => {
                 const w = kx.end - kx.start;
                 if (w > 0 && h > 0) {
-                   ctx.drawImage(img, kx.start, ky.start, w, h, destX, destY, w, h);
+                   resCtx.drawImage(img, kx.start, ky.start, w, h, destX, destY, w, h);
                 }
                 destX += w;
             });
             destY += h;
         });
 
+        // 3. Grid Persistence Logic
+        // Transform the current grid to the new coordinate system to avoid re-erasing
+        let nextGrid: Grid | undefined = undefined;
+        if (grid) {
+            
+            // To properly persist "Gaps", we need to map start/end coordinates.
+            const nextH = grid.horizontal.map(l => {
+                 const newPos = mapY(l.pos);
+                 const newStart = mapX(l.start);
+                 const newEnd = mapX(l.end);
+                 
+                 // Check if pos is inside a removed range
+                 let removed = false;
+                 for (const r of finalYRanges) { if (l.pos > r.start && l.pos < r.end) removed = true; }
+                 
+                 if (removed) return null;
+                 return { pos: newPos, thickness: l.thickness, start: newStart, end: newEnd };
+            }).filter(Boolean) as GridLine[];
+
+            const nextV = grid.vertical.map(l => {
+                 const newPos = mapX(l.pos);
+                 const newStart = mapY(l.start);
+                 const newEnd = mapY(l.end);
+                 let removed = false;
+                 for (const r of finalXRanges) { if (l.pos > r.start && l.pos < r.end) removed = true; }
+                 if (removed) return null;
+                 return { pos: newPos, thickness: l.thickness, start: newStart, end: newEnd };
+            }).filter(Boolean) as GridLine[];
+            
+            nextGrid = { horizontal: nextH, vertical: nextV };
+        }
+
+        // 4. Smart Content Restoration (Using Flood Fill Cells)
+        if (grid) {
+             const actualCells = getActualCells(grid, currentItem.width, currentItem.height);
+             
+             for (const cell of actualCells) {
+                 // Calculate Target Geometry
+                 const nx1 = mapX(cell.x);
+                 const nx2 = mapX(cell.x + cell.w);
+                 const ny1 = mapY(cell.y);
+                 const ny2 = mapY(cell.y + cell.h);
+                 const targetW = nx2 - nx1;
+                 const targetH = ny2 - ny1;
+
+                 // Check impact
+                 if (Math.abs(targetW - cell.w) < 2 && Math.abs(targetH - cell.h) < 2) continue;
+                 if (targetW < 4 || targetH < 4) continue;
+
+                 // Restore Content
+                 // Sample BG
+                 const sX = Math.min(img.width - 1, Math.floor(cell.x + 4));
+                 const sY = Math.min(img.height - 1, Math.floor(cell.y + 4));
+                 const sIdx = (sY * img.width + sX) * 4;
+                 const bgR = fullImageData.data[sIdx];
+                 const bgG = fullImageData.data[sIdx+1];
+                 const bgB = fullImageData.data[sIdx+2];
+
+                 // Extract
+                 const cellCanvas = document.createElement('canvas');
+                 cellCanvas.width = cell.w;
+                 cellCanvas.height = cell.h;
+                 const cCtx = cellCanvas.getContext('2d');
+                 if(!cCtx) continue;
+                 cCtx.drawImage(img, cell.x, cell.y, cell.w, cell.h, 0, 0, cell.w, cell.h);
+                 const d = cCtx.getImageData(0,0,cell.w, cell.h).data;
+
+                 let minCx = cell.w, minCy = cell.h, maxCx = 0, maxCy = 0;
+                 let hasContent = false;
+                 let sumX = 0; let pixelCount = 0;
+                 const tolerance = 30;
+
+                 for(let y=0; y<cell.h; y++) {
+                     for(let x=0; x<cell.w; x++) {
+                         const ii = (y * cell.w + x) * 4;
+                         if (Math.abs(d[ii] - bgR) > tolerance ||
+                             Math.abs(d[ii+1] - bgG) > tolerance ||
+                             Math.abs(d[ii+2] - bgB) > tolerance) {
+                             hasContent = true;
+                             if(x<minCx) minCx=x; if(x>maxCx) maxCx=x;
+                             if(y<minCy) minCy=y; if(y>maxCy) maxCy=y;
+                             sumX += x; pixelCount++;
+                         }
+                     }
+                 }
+
+                 if (!hasContent) continue;
+                 const contentW = maxCx - minCx + 1;
+                 const contentH = maxCy - minCy + 1;
+
+                 // Draw BG
+                 resCtx.fillStyle = `rgb(${bgR}, ${bgG}, ${bgB})`;
+                 resCtx.fillRect(nx1, ny1, targetW, targetH);
+
+                 // Draw Content
+                 const contentCanvas = document.createElement('canvas');
+                 contentCanvas.width = contentW;
+                 contentCanvas.height = contentH;
+                 const ccCtx = contentCanvas.getContext('2d');
+                 ccCtx?.drawImage(cellCanvas, minCx, minCy, contentW, contentH, 0, 0, contentW, contentH);
+
+                 const centerMass = sumX / pixelCount;
+                 const geoCenter = cell.w / 2;
+                 let align = 'center';
+                 if (centerMass < geoCenter - cell.w * 0.1) align = 'left';
+                 else if (centerMass > geoCenter + cell.w * 0.1) align = 'right';
+
+                 const padding = 2;
+                 const availW = Math.max(1, targetW - padding*2);
+                 const availH = Math.max(1, targetH - padding*2);
+                 const scale = Math.min(1, availW / contentW, availH / contentH);
+                 const finalW = contentW * scale;
+                 const finalH = contentH * scale;
+
+                 let drawX = nx1 + padding;
+                 if (align === 'center') drawX = nx1 + (targetW - finalW) / 2;
+                 else if (align === 'right') drawX = nx2 - finalW - padding;
+                 const drawY = ny1 + (targetH - finalH) / 2;
+
+                 resCtx.drawImage(contentCanvas, drawX, drawY, finalW, finalH);
+             }
+        }
+
         const newDataUrl = canvas.toDataURL();
         const newHistory = history.slice(0, historyIndex + 1);
         newHistory.push({
             dataUrl: newDataUrl,
             width: newW,
-            height: newH
+            height: newH,
+            grid: nextGrid // Pass the processed grid to the next state
         });
 
         setHistory(newHistory);
@@ -778,7 +1085,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
       {/* Canvas Area */}
       <div 
         ref={containerRef}
-        className="flex-1 bg-slate-100 dark:bg-slate-950 overflow-hidden flex items-center justify-center p-4 md:p-8 relative cursor-crosshair select-none touch-none"
+        className={`flex-1 bg-slate-100 dark:bg-slate-950 overflow-hidden flex items-center justify-center p-4 md:p-8 relative select-none touch-none ${isEditingGrid ? 'cursor-cell' : 'cursor-crosshair'}`}
         onMouseDown={handlePointerDown}
         onMouseMove={handlePointerMove}
         onMouseUp={handlePointerUp}
@@ -840,9 +1147,18 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             </button>
         )}
         
-        <div className={`absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-900/80 text-white text-xs rounded-full pointer-events-none backdrop-blur-sm shadow-lg border border-white/10 z-10 flex items-center gap-2 transition-opacity duration-500 ${showToast ? 'opacity-100' : 'opacity-0'}`}>
-            <Grid3X3 size={14} className="text-brand-400 animate-pulse" />
-            <span>点按单元格自动选中，拖拽手动框选</span>
+        <div className={`absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 bg-slate-900/80 text-white text-xs rounded-full pointer-events-none backdrop-blur-sm shadow-lg border border-white/10 z-10 flex items-center gap-2 transition-opacity duration-500 ${(showToast || isEditingGrid) ? 'opacity-100' : 'opacity-0'}`}>
+            {isEditingGrid ? (
+                <>
+                    <Eraser size={14} className="text-red-400 animate-pulse" />
+                    <span>点击擦除线段 (按住 Alt 删除整行)</span>
+                </>
+            ) : (
+                <>
+                    <Grid3X3 size={14} className="text-brand-400 animate-pulse" />
+                    <span>点按单元格自动选中，拖拽手动框选</span>
+                </>
+            )}
         </div>
       </div>
 
@@ -860,11 +1176,26 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
       ">
         {/* Operations */}
         <div className="p-4 md:p-6 border-b border-slate-200 dark:border-slate-800 flex-1 md:flex-none">
-            <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 md:mb-4">操作</h2>
-            
+            <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 md:mb-4">工具</h2>
+             <div className="mb-4">
+                <button 
+                    onClick={() => { setIsEditingGrid(!isEditingGrid); setSelections([]); }}
+                    className={`w-full flex items-center justify-center gap-2 p-3 rounded-xl border transition-all ${isEditingGrid 
+                        ? 'bg-red-50 dark:bg-red-900/20 border-red-500 text-red-600 dark:text-red-400' 
+                        : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'}`}
+                >
+                    <Eraser size={18} />
+                    <span className="font-medium">{isEditingGrid ? '完成编辑' : '手动擦除表格线'}</span>
+                </button>
+                <p className="text-[10px] text-slate-400 mt-1.5 px-1">
+                    点击擦除多余线条来合并单元格。<br/>按住 Alt 键可删除整行/整列。
+                </p>
+             </div>
+
+            <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 md:mb-4">裁切操作</h2>
             <div className="grid grid-cols-3 md:grid-cols-1 gap-2 md:gap-3">
                 <button 
-                    disabled={!hasSelection}
+                    disabled={!hasSelection || isEditingGrid}
                     onClick={() => performCrop('horizontal')}
                     className="group flex flex-col md:flex-row items-center p-2 md:p-3 gap-2 md:gap-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800 hover:border-brand-500/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -878,7 +1209,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 </button>
 
                 <button 
-                    disabled={!hasSelection}
+                    disabled={!hasSelection || isEditingGrid}
                     onClick={() => performCrop('vertical')}
                     className="group flex flex-col md:flex-row items-center p-2 md:p-3 gap-2 md:gap-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800 hover:border-brand-500/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -892,7 +1223,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 </button>
 
                 <button 
-                    disabled={!hasSelection}
+                    disabled={!hasSelection || isEditingGrid}
                     onClick={() => performCrop('both')}
                     className="group flex flex-col md:flex-row items-center p-2 md:p-3 gap-2 md:gap-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800 hover:border-brand-500/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -905,39 +1236,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                     </div>
                 </button>
             </div>
-        </div>
-
-        {/* History & Download */}
-        <div className="p-4 md:p-6 bg-slate-50 dark:bg-slate-900/50 flex flex-row md:flex-col gap-4 items-center md:items-stretch">
-            <div className="flex-1">
-                <div className="hidden md:block text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-4">历史记录</div>
-                <div className="flex gap-2">
-                    <button 
-                        disabled={historyIndex <= 0}
-                        onClick={handleUndo}
-                        className="flex-1 flex items-center justify-center gap-2 p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-40 disabled:hover:bg-white dark:disabled:hover:bg-slate-800 transition-colors"
-                        title="撤销"
-                    >
-                        <Undo2 size={16} /> <span className="hidden md:inline">撤销</span>
-                    </button>
-                    <button 
-                        disabled={historyIndex >= history.length - 1}
-                        onClick={handleRedo}
-                        className="flex-1 flex items-center justify-center gap-2 p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-40 disabled:hover:bg-white dark:disabled:hover:bg-slate-800 transition-colors"
-                        title="重做"
-                    >
-                        <span className="hidden md:inline">重做</span> <Redo2 size={16} />
-                    </button>
-                </div>
-            </div>
-
-            <button 
-                onClick={handleDownload}
-                className="flex-1 md:flex-none py-3 md:py-4 bg-brand-600 hover:bg-brand-500 active:bg-brand-700 text-white font-bold rounded-xl shadow-lg shadow-brand-500/20 flex items-center justify-center gap-2 transition-all md:mt-4 whitespace-nowrap"
-            >
-                <Download size={20} />
-                <span className="md:inline">下载图片</span>
-            </button>
         </div>
       </div>
     </div>
