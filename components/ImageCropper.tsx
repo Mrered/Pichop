@@ -13,7 +13,9 @@ import {
   Smartphone,
   Trash2,
   Grid3X3,
-  Eraser
+  Eraser,
+  Spline,
+  Minus
 } from 'lucide-react';
 import { Rect, HistoryItem, CropMode, Grid, GridLine } from '../types';
 
@@ -40,6 +42,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const [currentDrag, setCurrentDrag] = useState<Rect | null>(null);
   const [grid, setGrid] = useState<Grid | null>(null);
   const [isEditingGrid, setIsEditingGrid] = useState(false);
+  const [eraserMode, setEraserMode] = useState<'segment' | 'line'>('segment');
+  const isGridDirty = useRef(false);
   
   // Eraser State
   const [hoveredSegment, setHoveredSegment] = useState<{ 
@@ -104,7 +108,10 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             setGrid(null); 
             startScanning(item);
         }
-        setIsEditingGrid(false);
+        // Fix: Do not reset isEditingGrid here. This allows the user to continue erasing
+        // lines after a history update (which happens on mouse up during erase).
+        // setIsEditingGrid(false); 
+        isGridDirty.current = false;
     }
   }, [historyIndex, history]);
 
@@ -351,7 +358,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   }, [history, historyIndex]);
 
   // --- Graph Traversal for "Merged Cell" Logic ---
-  // Returns list of Rects representing actual cells (merged or not)
   const getActualCells = (grid: Grid, w: number, h: number): Rect[] => {
       // 1. Build atomic blocks (Lattice)
       const ys = Array.from(new Set(grid.horizontal.map(l => l.pos).concat([0, h]))).sort((a,b)=>a-b);
@@ -462,52 +468,122 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     return { x, y };
   };
 
+  // --- Eraser Logic ---
+  const getEraserTarget = (currentGrid: Grid, coords: {x: number, y: number}, isLineMode: boolean) => {
+    const threshold = 20 / scale;
+    let bestSeg = null;
+    let minDest = threshold;
+    
+    const checkLines = (type: 'horizontal' | 'vertical') => {
+        const lines = type === 'horizontal' ? currentGrid.horizontal : currentGrid.vertical;
+        const perpLines = type === 'horizontal' ? currentGrid.vertical : currentGrid.horizontal;
+        
+        const coordMain = type === 'horizontal' ? coords.y : coords.x;
+        const coordCross = type === 'horizontal' ? coords.x : coords.y;
+
+        lines.forEach((l, i) => {
+            // Check if cursor is within line range
+            if (coordCross < l.start || coordCross > l.end) return;
+
+            const dist = Math.abs(coordMain - l.pos);
+            if (dist < minDest) {
+                // Find segment
+                let segStart = l.start;
+                let segEnd = l.end;
+
+                // Find closest perpendiculars
+                // Filter perps that actually cross this line
+                const crossings = perpLines
+                    .filter(p => p.start <= l.pos && p.end >= l.pos)
+                    .map(p => p.pos)
+                    .sort((a,b) => a-b);
+                
+                // Find bracket around cursor
+                for (const cp of crossings) {
+                    if (cp <= coordCross) segStart = Math.max(segStart, cp);
+                    else if (cp > coordCross) {
+                        segEnd = Math.min(segEnd, cp);
+                        break;
+                    }
+                }
+
+                minDest = dist;
+                bestSeg = { 
+                    type, 
+                    lineIndex: i, 
+                    start: segStart, 
+                    end: segEnd,
+                    isWholeLine: isLineMode 
+                };
+            }
+        });
+    };
+
+    checkLines('horizontal');
+    checkLines('vertical');
+    return bestSeg;
+  };
+
+  const applyErasure = (currentGrid: Grid, target: { type: 'horizontal' | 'vertical', lineIndex: number, start: number, end: number, isWholeLine: boolean }) => {
+    const newGrid = { 
+        horizontal: [...currentGrid.horizontal],
+        vertical: [...currentGrid.vertical]
+    };
+    
+    const targetArray = target.type === 'horizontal' ? newGrid.horizontal : newGrid.vertical;
+    const originalLine = targetArray[target.lineIndex];
+    
+    // Remove the original line
+    targetArray.splice(target.lineIndex, 1);
+
+    if (!target.isWholeLine) {
+         // Deleting segment: Split into two lines (gaps)
+         // Part 1: Start to SegmentStart
+         if (target.start > originalLine.start + 1) {
+             targetArray.push({ 
+                 pos: originalLine.pos, 
+                 thickness: originalLine.thickness, 
+                 start: originalLine.start, 
+                 end: target.start 
+             });
+         }
+         // Part 2: SegmentEnd to End
+         if (target.end < originalLine.end - 1) {
+             targetArray.push({ 
+                 pos: originalLine.pos, 
+                 thickness: originalLine.thickness, 
+                 start: target.end, 
+                 end: originalLine.end 
+             });
+         }
+    }
+    return newGrid;
+  };
+
   const handlePointerDown = (e: React.MouseEvent | React.TouchEvent) => {
     e.stopPropagation();
     if ('touches' in e && e.touches.length > 1) return; 
 
     // --- Eraser Mode Logic ---
-    if (isEditingGrid && grid && hoveredSegment) {
+    if (isEditingGrid && grid) {
+        setIsDragging(true);
+        isGridDirty.current = false;
+        
+        const coords = getPointerCoords(e);
+        const isLineMode = eraserMode === 'line' || e.altKey || e.metaKey;
+        
+        // Try initial erase on tap
         setGrid(prev => {
             if (!prev) return null;
-            const newGrid = { ...prev };
-            
-            const targetArray = hoveredSegment.type === 'horizontal' ? newGrid.horizontal : newGrid.vertical;
-            const originalLine = targetArray[hoveredSegment.lineIndex];
-            
-            // Remove the original line
-            targetArray.splice(hoveredSegment.lineIndex, 1);
-
-            if (hoveredSegment.isWholeLine) {
-                 // Deleting whole line: Do nothing (just splice above)
-            } else {
-                 // Deleting segment: Split into two lines (gaps)
-                 // Part 1: Start to SegmentStart
-                 if (hoveredSegment.start > originalLine.start + 1) {
-                     targetArray.push({ 
-                         pos: originalLine.pos, 
-                         thickness: originalLine.thickness, 
-                         start: originalLine.start, 
-                         end: hoveredSegment.start 
-                     });
-                 }
-                 // Part 2: SegmentEnd to End
-                 if (hoveredSegment.end < originalLine.end - 1) {
-                     targetArray.push({ 
-                         pos: originalLine.pos, 
-                         thickness: originalLine.thickness, 
-                         start: hoveredSegment.end, 
-                         end: originalLine.end 
-                     });
-                 }
+            const target = getEraserTarget(prev, coords, isLineMode);
+            if (target) {
+                isGridDirty.current = true;
+                return applyErasure(prev, target);
             }
-            return newGrid;
+            return prev;
         });
-        setHoveredSegment(null); 
         return;
     }
-
-    if (isEditingGrid) return;
 
     const coords = getPointerCoords(e);
     setDragStart(coords);
@@ -518,62 +594,28 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const handlePointerMove = (e: React.MouseEvent | React.TouchEvent) => {
     const coords = getPointerCoords(e);
 
-    // --- Eraser Mode Highlight ---
     if (isEditingGrid && grid) {
-        const threshold = 20 / scale;
-        let bestSeg = null;
-        let minDest = threshold;
-        const isWholeLine = e.altKey || e.metaKey; // Modifier key for whole line
-
-        const checkLines = (type: 'horizontal' | 'vertical') => {
-            const lines = type === 'horizontal' ? grid.horizontal : grid.vertical;
-            const perpLines = type === 'horizontal' ? grid.vertical : grid.horizontal;
-            
-            const coordMain = type === 'horizontal' ? coords.y : coords.x;
-            const coordCross = type === 'horizontal' ? coords.x : coords.y;
-
-            lines.forEach((l, i) => {
-                // Check if cursor is within line range
-                if (coordCross < l.start || coordCross > l.end) return;
-
-                const dist = Math.abs(coordMain - l.pos);
-                if (dist < minDest) {
-                    // Find segment
-                    let segStart = l.start;
-                    let segEnd = l.end;
-
-                    // Find closest perpendiculars
-                    // Filter perps that actually cross this line
-                    const crossings = perpLines
-                        .filter(p => p.start <= l.pos && p.end >= l.pos)
-                        .map(p => p.pos)
-                        .sort((a,b) => a-b);
-                    
-                    // Find bracket around cursor
-                    for (const cp of crossings) {
-                        if (cp <= coordCross) segStart = Math.max(segStart, cp);
-                        else if (cp > coordCross) {
-                            segEnd = Math.min(segEnd, cp);
-                            break;
-                        }
-                    }
-
-                    minDest = dist;
-                    bestSeg = { 
-                        type, 
-                        lineIndex: i, 
-                        start: segStart, 
-                        end: segEnd,
-                        isWholeLine: isWholeLine 
-                    };
-                }
-            });
-        };
-
-        checkLines('horizontal');
-        checkLines('vertical');
+        const isLineMode = eraserMode === 'line' || e.altKey || e.metaKey;
         
-        setHoveredSegment(bestSeg);
+        if (isDragging) {
+             // Swipe to delete
+             setGrid(prev => {
+                if (!prev) return null;
+                const target = getEraserTarget(prev, coords, isLineMode);
+                if (target) {
+                    isGridDirty.current = true;
+                    return applyErasure(prev, target);
+                }
+                return prev;
+             });
+             setHoveredSegment(null);
+        } else {
+             // Just Hover
+             // Note: We use the 'grid' from closure which might be slightly stale if we just erased,
+             // but 'grid' is in dependency of useEffect/render, so checking it here is fine for hover.
+             const target = getEraserTarget(grid, coords, isLineMode);
+             setHoveredSegment(target);
+        }
         setHoveredCell(null);
         return;
     } else {
@@ -600,7 +642,22 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const handlePointerUp = (e: React.MouseEvent | React.TouchEvent) => {
     setIsDragging(false);
     
-    if (isEditingGrid) return;
+    if (isEditingGrid) {
+        if (isGridDirty.current && grid) {
+             // Commit grid changes to history
+             const newItem: HistoryItem = {
+                 ...history[historyIndex],
+                 grid: grid // The current grid state
+             };
+             const newHistory = history.slice(0, historyIndex + 1);
+             newHistory.push(newItem);
+             setHistory(newHistory);
+             setHistoryIndex(newHistory.length - 1);
+             isGridDirty.current = false;
+        }
+        setHoveredSegment(null); // CRITICAL FIX: Clear the hovered segment so we don't try to access a deleted line in render
+        return;
+    }
     
     if (currentDrag) {
         if (Math.abs(currentDrag.w) < 5 && Math.abs(currentDrag.h) < 5) {
@@ -702,22 +759,28 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 ctx.shadowBlur = 5;
                 
                 if (hoveredSegment.type === 'horizontal') {
-                    const y = grid.horizontal[hoveredSegment.lineIndex].pos;
-                    if (hoveredSegment.isWholeLine) {
-                         ctx.moveTo(grid.horizontal[hoveredSegment.lineIndex].start, y);
-                         ctx.lineTo(grid.horizontal[hoveredSegment.lineIndex].end, y);
-                    } else {
-                         ctx.moveTo(hoveredSegment.start, y);
-                         ctx.lineTo(hoveredSegment.end, y);
+                    const line = grid.horizontal[hoveredSegment.lineIndex];
+                    if (line) { // Check existence to avoid crash on deleted lines
+                        const y = line.pos;
+                        if (hoveredSegment.isWholeLine) {
+                             ctx.moveTo(line.start, y);
+                             ctx.lineTo(line.end, y);
+                        } else {
+                             ctx.moveTo(hoveredSegment.start, y);
+                             ctx.lineTo(hoveredSegment.end, y);
+                        }
                     }
                 } else {
-                    const x = grid.vertical[hoveredSegment.lineIndex].pos;
-                     if (hoveredSegment.isWholeLine) {
-                         ctx.moveTo(x, grid.vertical[hoveredSegment.lineIndex].start);
-                         ctx.lineTo(x, grid.vertical[hoveredSegment.lineIndex].end);
-                    } else {
-                        ctx.moveTo(x, hoveredSegment.start);
-                        ctx.lineTo(x, hoveredSegment.end);
+                    const line = grid.vertical[hoveredSegment.lineIndex];
+                    if (line) { // Check existence
+                        const x = line.pos;
+                         if (hoveredSegment.isWholeLine) {
+                             ctx.moveTo(x, line.start);
+                             ctx.lineTo(x, line.end);
+                        } else {
+                            ctx.moveTo(x, hoveredSegment.start);
+                            ctx.lineTo(x, hoveredSegment.end);
+                        }
                     }
                 }
                 ctx.stroke();
@@ -1151,7 +1214,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             {isEditingGrid ? (
                 <>
                     <Eraser size={14} className="text-red-400 animate-pulse" />
-                    <span>点击擦除线段 (按住 Alt 删除整行)</span>
+                    <span>滑动擦除{eraserMode === 'line' ? '整行' : '线段'} (Alt 键切换)</span>
                 </>
             ) : (
                 <>
@@ -1171,11 +1234,11 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         bg-white dark:bg-slate-900 
         border-t md:border-t-0 md:border-l border-slate-200 dark:border-slate-800 
         flex flex-col z-30 shadow-xl
-        max-h-[40vh] md:max-h-full overflow-y-auto md:overflow-visible
+        h-[45vh] md:h-full 
         safe-bottom pointer-events-auto
       ">
-        {/* Operations */}
-        <div className="p-4 md:p-6 border-b border-slate-200 dark:border-slate-800 flex-1 md:flex-none">
+        {/* Operations Scroll Area */}
+        <div className="flex-1 overflow-y-auto p-4 md:p-6 min-h-0">
             <h2 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3 md:mb-4">工具</h2>
              <div className="mb-4">
                 <button 
@@ -1187,8 +1250,32 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                     <Eraser size={18} />
                     <span className="font-medium">{isEditingGrid ? '完成编辑' : '手动擦除表格线'}</span>
                 </button>
-                <p className="text-[10px] text-slate-400 mt-1.5 px-1">
-                    点击擦除多余线条来合并单元格。<br/>按住 Alt 键可删除整行/整列。
+                
+                {/* Eraser Mode Toggle */}
+                {isEditingGrid && (
+                   <div className="mt-3 flex gap-2 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+                      <button 
+                         onClick={() => setEraserMode('segment')}
+                         className={`flex-1 py-1.5 px-2 rounded-md text-xs font-medium flex items-center justify-center gap-1 transition-all ${eraserMode === 'segment' 
+                           ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' 
+                           : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}
+                      >
+                         <Minus size={14} /> 擦除线段
+                      </button>
+                      <button 
+                         onClick={() => setEraserMode('line')}
+                         className={`flex-1 py-1.5 px-2 rounded-md text-xs font-medium flex items-center justify-center gap-1 transition-all ${eraserMode === 'line' 
+                           ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' 
+                           : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'}`}
+                      >
+                         <Spline size={14} /> 擦除整行
+                      </button>
+                   </div>
+                )}
+
+                <p className="text-[10px] text-slate-400 mt-2 px-1 leading-relaxed">
+                    滑动即可擦除路径上的线条。<br/>
+                    {isEditingGrid ? '切换上方模式可删除整行/整列。' : '点击上方按钮开始编辑表格结构。'}
                 </p>
              </div>
 
@@ -1236,6 +1323,39 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                     </div>
                 </button>
             </div>
+        </div>
+        
+        {/* Footer (History & Download) */}
+        <div className="flex-none p-4 md:p-6 bg-slate-50 dark:bg-slate-900/50 border-t border-slate-200 dark:border-slate-800 flex flex-row md:flex-col gap-4 items-center md:items-stretch z-10 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] dark:shadow-none">
+            <div className="flex-1">
+                <div className="hidden md:block text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-4">历史记录</div>
+                <div className="flex gap-2">
+                    <button 
+                        disabled={historyIndex <= 0}
+                        onClick={handleUndo}
+                        className="flex-1 flex items-center justify-center gap-2 p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-40 disabled:hover:bg-white dark:disabled:hover:bg-slate-800 transition-colors"
+                        title="撤销"
+                    >
+                        <Undo2 size={16} /> <span className="hidden md:inline">撤销</span>
+                    </button>
+                    <button 
+                        disabled={historyIndex >= history.length - 1}
+                        onClick={handleRedo}
+                        className="flex-1 flex items-center justify-center gap-2 p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-40 disabled:hover:bg-white dark:disabled:hover:bg-slate-800 transition-colors"
+                        title="重做"
+                    >
+                        <span className="hidden md:inline">重做</span> <Redo2 size={16} />
+                    </button>
+                </div>
+            </div>
+
+            <button 
+                onClick={handleDownload}
+                className="flex-1 md:flex-none py-3 md:py-4 bg-brand-600 hover:bg-brand-500 active:bg-brand-700 text-white font-bold rounded-xl shadow-lg shadow-brand-500/20 flex items-center justify-center gap-2 transition-all md:mt-4 whitespace-nowrap"
+            >
+                <Download size={20} />
+                <span className="md:inline">下载图片</span>
+            </button>
         </div>
       </div>
     </div>

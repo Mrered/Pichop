@@ -1,4 +1,3 @@
-
 import React, { useRef, useEffect } from 'react';
 import { Grid, Rect, GridLine } from '../../../types';
 import { EraserHover } from '../types';
@@ -92,22 +91,28 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
                 ctx.shadowBlur = 5;
                 
                 if (hoveredSegment.type === 'horizontal') {
-                    const y = grid.horizontal[hoveredSegment.lineIndex].pos;
-                    if (hoveredSegment.isWholeLine) {
-                         ctx.moveTo(grid.horizontal[hoveredSegment.lineIndex].start, y);
-                         ctx.lineTo(grid.horizontal[hoveredSegment.lineIndex].end, y);
-                    } else {
-                         ctx.moveTo(hoveredSegment.start, y);
-                         ctx.lineTo(hoveredSegment.end, y);
+                    const line = grid.horizontal[hoveredSegment.lineIndex];
+                    if (line) { // Safety check: line might have been deleted
+                        const y = line.pos;
+                        if (hoveredSegment.isWholeLine) {
+                             ctx.moveTo(line.start, y);
+                             ctx.lineTo(line.end, y);
+                        } else {
+                             ctx.moveTo(hoveredSegment.start, y);
+                             ctx.lineTo(hoveredSegment.end, y);
+                        }
                     }
                 } else {
-                    const x = grid.vertical[hoveredSegment.lineIndex].pos;
-                     if (hoveredSegment.isWholeLine) {
-                         ctx.moveTo(x, grid.vertical[hoveredSegment.lineIndex].start);
-                         ctx.lineTo(x, grid.vertical[hoveredSegment.lineIndex].end);
-                    } else {
-                        ctx.moveTo(x, hoveredSegment.start);
-                        ctx.lineTo(x, hoveredSegment.end);
+                    const line = grid.vertical[hoveredSegment.lineIndex];
+                    if (line) { // Safety check
+                        const x = line.pos;
+                         if (hoveredSegment.isWholeLine) {
+                             ctx.moveTo(x, line.start);
+                             ctx.lineTo(x, line.end);
+                        } else {
+                            ctx.moveTo(x, hoveredSegment.start);
+                            ctx.lineTo(x, hoveredSegment.end);
+                        }
                     }
                 }
                 ctx.stroke();

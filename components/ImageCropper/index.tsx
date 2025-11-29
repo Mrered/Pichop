@@ -1,4 +1,3 @@
-
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Rect, HistoryItem, CropMode, Grid } from '../../types';
 import { detectGrid } from './logic/gridDetection';
@@ -76,7 +75,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 });
             }, 100);
         }
-        setIsEditingGrid(false);
+        // setIsEditingGrid(false); // REMOVED: Keep edit mode active after history changes (erasing)
     }
   }, [historyIndex, history]);
 
@@ -251,6 +250,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
             }
         }
         gridSnapshotRef.current = null;
+        setHoveredSegment(null); // Fix: Clear hover segment to prevent access to deleted lines
         return;
     }
 
