@@ -13,6 +13,7 @@ interface CanvasViewProps {
   currentDrag: Rect | null;
   isScanning: boolean;
   isEditingGrid: boolean;
+  isGesturing: boolean;
   hoveredCell: Rect | null;
   hoveredSegment: EraserHover | null;
   onPointerDown: (e: React.MouseEvent | React.TouchEvent) => void;
@@ -23,7 +24,7 @@ interface CanvasViewProps {
 
 export const CanvasView: React.FC<CanvasViewProps> = ({
   imageSrc, width, height, scale, pan, grid, selections, currentDrag, 
-  isScanning, isEditingGrid, hoveredCell, hoveredSegment,
+  isScanning, isEditingGrid, isGesturing, hoveredCell, hoveredSegment,
   onPointerDown, onPointerMove, onPointerUp, onWheel
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -223,7 +224,8 @@ export const CanvasView: React.FC<CanvasViewProps> = ({
             style={{ 
                 transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`, 
                 transformOrigin: 'center',
-                transition: currentDrag ? 'none' : 'transform 0.05s linear' // Faster transition for smooth pan/zoom
+                // Disable transition during dragging or gesturing to prevent jitter
+                transition: (currentDrag || isGesturing) ? 'none' : 'transform 0.1s linear'
             }}
             className={`shadow-2xl shadow-black/20 dark:shadow-black/50 ${isScanning ? 'opacity-90' : 'opacity-100'}`}
         >

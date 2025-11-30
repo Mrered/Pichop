@@ -34,6 +34,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const [hoveredSegment, setHoveredSegment] = useState<EraserHover | null>(null);
   
   const [isDragging, setIsDragging] = useState(false);
+  const [isGesturing, setIsGesturing] = useState(false); // Track multi-touch gesture status
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   // Logic Refs
@@ -169,6 +170,8 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     if ('touches' in e && e.touches.length === 2) {
        e.preventDefault();
        gestureRef.current.isGesturing = true;
+       setIsGesturing(true); // Trigger re-render to disable transition
+       
        const t1 = e.touches[0];
        const t2 = e.touches[1];
        
@@ -232,8 +235,6 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
         const Pan_start = gestureRef.current.startPan;
         const Scale_start = gestureRef.current.startScale;
         
-        // Formula: Pan_new = F_curr - C - (F_start - C - Pan_start) * (Scale_new / Scale_start)
-        // This ensures the point under the fingers remains under the fingers while scaling.
         const scaleRatio = newScale / Scale_start;
         const newPanX = cx - C.x - (F_start.x - C.x - Pan_start.x) * scaleRatio;
         const newPanY = cy - C.y - (F_start.y - C.y - Pan_start.y) * scaleRatio;
@@ -308,6 +309,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     if (gestureRef.current.isGesturing) {
         if (!('touches' in e) || e.touches.length < 2) {
             gestureRef.current.isGesturing = false;
+            setIsGesturing(false);
         }
     }
     
@@ -386,7 +388,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
     <div className="flex flex-col md:flex-row h-full w-full relative">
       <div 
         ref={containerRef}
-        className="flex-1 relative overflow-hidden flex flex-col w-full min-h-0" 
+        className="flex-1 relative overflow-hidden flex flex-col w-full min-h-0 bg-slate-100 dark:bg-slate-950" 
         style={{ touchAction: 'none' }}
       >
         {currentItem && (
@@ -401,6 +403,7 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
                 currentDrag={currentDrag}
                 isScanning={isScanning}
                 isEditingGrid={isEditingGrid}
+                isGesturing={isGesturing}
                 hoveredCell={hoveredCell}
                 hoveredSegment={hoveredSegment}
                 onPointerDown={handlePointerDown}
