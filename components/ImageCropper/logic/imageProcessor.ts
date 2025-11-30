@@ -1,3 +1,4 @@
+
 import { CropMode, Grid, GridLine, HistoryItem, Rect } from '../../../types';
 import { getActualCells } from './gridManipulation';
 
@@ -29,27 +30,27 @@ const getRegionEnergy = (
     const stride = 2; // Optimization: Skip pixels
     let pixelsChecked = 0;
     
-    // Bounds check
-    const maxY = Math.min(startY + h, data.length / 4 / width);
+    const height = data.length / 4 / width;
+    // Ensure we don't read past the data array
+    const maxY = Math.min(startY + h, height);
     const maxX = Math.min(startX + w, width);
 
     for (let y = Math.max(0, startY); y < maxY; y += stride) {
-        for (let x = Math.max(0, startX); x < maxX - 1; x += stride) {
+        for (let x = Math.max(0, startX); x < maxX; x += stride) {
+            // We compare pixel x with x+1, so x+1 must be valid
+            if (x + 1 >= width) continue;
+
             pixelsChecked++;
             const idx = (y * width + x) * 4;
             // Simple edge detection: |Current - Next|
             const r1 = data[idx], g1 = data[idx+1], b1 = data[idx+2];
             const r2 = data[idx+4], g2 = data[idx+5], b2 = data[idx+6];
             
-            // Weight brightness (prefer white backgrounds for cuts)
-            const brightness = (r1 + g1 + b1) / 3;
-            // Heavily penalize dark pixels (text usually)
-            // If pixel is not white/light grey, add penalty
-            const isDark = brightness < 230; 
+            // Removed 'isDark' penalty which was causing flat colored backgrounds 
+            // (common in table rows) to be flagged as high-energy content, 
+            // leading to incorrect squishing instead of cutting.
             const diff = Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
-            
-            if (isDark) energy += (diff + 20); 
-            else energy += diff;
+            energy += diff;
         }
     }
     return pixelsChecked > 0 ? energy / pixelsChecked : 0;
@@ -89,9 +90,13 @@ const getStripOperations = (
     // Pre-calculating this saves performance in the pixel loop
     const stripCellsIndices = axisCells.map((c, idx) => {
         if (isVerticalCut) {
+            // Vertical Cut = Removing Rows. Strip is a Column (X range).
+            // Check if cell horizontally overlaps the strip.
             const inStrip = (c.x < stripEnd) && (c.x + c.w > stripStart);
             return inStrip ? idx : -1;
         } else {
+            // Horizontal Cut = Removing Cols. Strip is a Row (Y range).
+            // Check if cell vertically overlaps the strip.
             const inStrip = (c.y < stripEnd) && (c.y + c.h > stripStart);
             return inStrip ? idx : -1;
         }
@@ -104,14 +109,26 @@ const getStripOperations = (
         const mainDim = isVerticalCut ? cell.h : cell.w;
         const blockSize = 2; 
 
+        // CRITICAL FIX: Restrict the energy check to the intersection of the cell and the strip.
+        // Even if the cell is very wide (or tall), we only care if the *current strip* contains content.
+        // This prevents content in Column A from preventing cuts in empty Column B for the same Row.
+        const crossStart = isVerticalCut ? cell.x : cell.y;
+        const crossDim = isVerticalCut ? cell.w : cell.h;
+        
+        const checkStart = Math.max(crossStart, stripStart);
+        const checkEnd = Math.min(crossStart + crossDim, stripEnd);
+        const checkDim = Math.max(1, checkEnd - checkStart);
+
         for(let i = 0; i < mainDim; i += blockSize) {
             const currentPos = mainStart + i;
             if (currentPos >= totalSize) break;
 
             const size = Math.min(blockSize, mainDim - i);
+            
+            // Use the intersected bounds for energy check
             const energy = isVerticalCut 
-                ? getRegionEnergy(imgData, imgW, cell.x, currentPos, cell.w, size)
-                : getRegionEnergy(imgData, imgW, currentPos, cell.y, size, cell.h);
+                ? getRegionEnergy(imgData, imgW, checkStart, currentPos, checkDim, size)
+                : getRegionEnergy(imgData, imgW, currentPos, checkStart, size, checkDim);
             
             if (energy < UNSAFE_ENERGY_THRESHOLD) {
                 for(let k=0; k<size; k++) safeLines.push(currentPos + k);
@@ -155,10 +172,10 @@ const getStripOperations = (
 
         const cell = axisCells[cellIdx];
         
-        // Find safe lines in this cell
+        // Find safe lines in this cell (within the current strip context)
         const safeLines = analyzeCellSafety(cell);
         
-        // Only use safe lines that aren't already marked for cutting (e.g. by gap logic, though unlikely to overlap)
+        // Only use safe lines that aren't already marked for cutting
         const availableSafeLines = safeLines.filter(pos => pixelAction[pos] === 0);
 
         // Group into contiguous blocks to prioritize larger whitespace chunks
@@ -204,65 +221,83 @@ const getStripOperations = (
     const ops: DrawOperation[] = [];
     let currentStart = -1;
     
+    // IMPORTANT: Collect cell boundaries. We MUST split segments at cell boundaries
+    // to ensure that we apply the correct debt/scaling to the correct regions.
+    const splitPoints = new Set<number>();
+    stripCellsIndices.forEach(cIdx => {
+         const c = axisCells[cIdx];
+         const start = isVerticalCut ? c.y : c.x;
+         const end = isVerticalCut ? c.y + c.h : c.x + c.w;
+         splitPoints.add(start);
+         splitPoints.add(end);
+    });
+
     for (let i = 0; i <= totalSize; i++) {
         const isCut = i < totalSize ? pixelAction[i] === 1 : true; 
-        
-        if (!isCut) {
-            if (currentStart === -1) currentStart = i;
-        } else {
-            if (currentStart !== -1) {
+        const isSplit = splitPoints.has(i);
+
+        // If we have a running segment and we hit a cut OR a boundary, close it.
+        if (currentStart !== -1) {
+            if (isCut || isSplit) {
                 // End of a "Keep" segment
                 const segmentStart = currentStart;
                 const segmentEnd = i;
                 const segmentLen = segmentEnd - segmentStart;
                 
-                let destLen = segmentLen;
-                
-                // Check if this segment belongs to a cell with debt
-                const mid = segmentStart + segmentLen / 2;
-                
-                // Find which cell this segment belongs to
-                let inCellIdx = -1;
-                for (const cIdx of stripCellsIndices) {
-                     const c = axisCells[cIdx];
-                     const cStart = isVerticalCut ? c.y : c.x;
-                     const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
-                     if (mid >= cStart && mid <= cEnd) {
-                         inCellIdx = cIdx;
-                         break;
-                     }
-                }
-
-                if (inCellIdx !== -1 && cellSquishDebt.has(inCellIdx)) {
-                    // Calculate scaling factor
-                    // Scale = (TotalRemainingCellLength - Debt) / TotalRemainingCellLength
-                    let totalRemainingCellLen = 0;
-                    const c = axisCells[inCellIdx];
-                    const cStart = isVerticalCut ? c.y : c.x;
-                    const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
+                if (segmentLen > 0) {
+                    let destLen = segmentLen;
                     
-                    for(let k=cStart; k<cEnd; k++) {
-                        if (k >= 0 && k < totalSize && pixelAction[k] === 0) {
-                            totalRemainingCellLen++;
+                    // Check if this segment belongs to a cell with debt
+                    const mid = segmentStart + segmentLen / 2;
+                    
+                    // Find which cell this segment belongs to
+                    let inCellIdx = -1;
+                    for (const cIdx of stripCellsIndices) {
+                         const c = axisCells[cIdx];
+                         const cStart = isVerticalCut ? c.y : c.x;
+                         const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
+                         // Use strict inequality for boundaries to match split logic
+                         if (mid >= cStart && mid < cEnd) {
+                             inCellIdx = cIdx;
+                             break;
+                         }
+                    }
+
+                    if (inCellIdx !== -1 && cellSquishDebt.has(inCellIdx)) {
+                        // Calculate scaling factor
+                        // Scale = (TotalRemainingCellLength - Debt) / TotalRemainingCellLength
+                        let totalRemainingCellLen = 0;
+                        const c = axisCells[inCellIdx];
+                        const cStart = isVerticalCut ? c.y : c.x;
+                        const cEnd = isVerticalCut ? c.y + c.h : c.x + c.w;
+                        
+                        for(let k=cStart; k<cEnd; k++) {
+                            if (k >= 0 && k < totalSize && pixelAction[k] === 0) {
+                                totalRemainingCellLen++;
+                            }
+                        }
+
+                        if (totalRemainingCellLen > 0) {
+                            const debt = cellSquishDebt.get(inCellIdx)!;
+                            // Prevent scale < 0
+                            const scale = Math.max(0, totalRemainingCellLen - debt) / totalRemainingCellLen;
+                            destLen = segmentLen * scale;
                         }
                     }
 
-                    if (totalRemainingCellLen > 0) {
-                        const debt = cellSquishDebt.get(inCellIdx)!;
-                        // Prevent scale < 0
-                        const scale = Math.max(0, totalRemainingCellLen - debt) / totalRemainingCellLen;
-                        destLen = segmentLen * scale;
-                    }
+                    ops.push({
+                        srcStart: segmentStart,
+                        srcLen: segmentLen,
+                        destLen: destLen
+                    });
                 }
-
-                ops.push({
-                    srcStart: segmentStart,
-                    srcLen: segmentLen,
-                    destLen: destLen
-                });
                 
                 currentStart = -1;
             }
+        }
+        
+        if (!isCut) {
+            if (currentStart === -1) currentStart = i;
         }
     }
 
