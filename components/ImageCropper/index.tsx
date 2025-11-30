@@ -377,32 +377,73 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
   const handleDownload = async () => {
     if (historyIndex < 0) return;
     const dataUrl = history[historyIndex].dataUrl;
-
-    // Try native sharing (works best on mobile for saving to photos)
+    // 1) Try native sharing (best on mobile)
     if (navigator.share) {
       try {
         const blob = await (await fetch(dataUrl)).blob();
         const file = new File([blob], `smart-slice-${Date.now()}.png`, { type: 'image/png' });
-        
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({
-            files: [file],
-            title: 'Smart Slice Image',
-          });
+
+        if ((navigator as any).canShare && (navigator as any).canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: 'Smart Slice Image' });
           return;
         }
       } catch (err) {
-        console.error('Share failed:', err);
-        // Continue to fallback if share was not aborted by user
+        console.warn('Share failed:', err);
         if ((err as Error).name === 'AbortError') return;
+        // fall through to other save methods
       }
     }
 
-    // Fallback: Link download (Desktop)
-    const link = document.createElement('a');
-    link.download = `smart-slice-${Date.now()}.png`;
-    link.href = dataUrl;
-    link.click();
+    // Helper: fetch dataUrl -> Blob
+    const dataUrlToBlob = async (url: string) => {
+      // fetch works for both data: URLs and regular URLs
+      const resp = await fetch(url);
+      return await resp.blob();
+    };
+
+    const suggestedName = `smart-slice-${Date.now()}.png`;
+
+    // 2) Prefer File System Access API (opens native save dialog on supported platforms)
+    const anyWin = window as any;
+    try {
+      if (anyWin.showSaveFilePicker) {
+        const blob = await dataUrlToBlob(dataUrl);
+        const handle = await anyWin.showSaveFilePicker({
+          suggestedName,
+          types: [
+            {
+              description: 'PNG Image',
+              accept: { 'image/png': ['.png'] }
+            }
+          ]
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        return;
+      }
+    } catch (err) {
+      console.warn('showSaveFilePicker failed:', err);
+      // continue to fallback
+    }
+
+    // 3) Robust fallback: create Blob URL and use an appended anchor element
+    try {
+      const blob = await dataUrlToBlob(dataUrl);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.style.display = 'none';
+      link.href = url;
+      link.download = suggestedName;
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        link.remove();
+      }, 1500);
+    } catch (err) {
+      console.error('Download fallback failed:', err);
+    }
   };
 
   const currentItem = history[historyIndex];
