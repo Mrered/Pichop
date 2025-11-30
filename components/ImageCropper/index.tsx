@@ -374,11 +374,34 @@ export const ImageCropper: React.FC<ImageCropperProps> = ({ initialImage }) => {
       }
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (historyIndex < 0) return;
+    const dataUrl = history[historyIndex].dataUrl;
+
+    // Try native sharing (works best on mobile for saving to photos)
+    if (navigator.share) {
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        const file = new File([blob], `smart-slice-${Date.now()}.png`, { type: 'image/png' });
+        
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            files: [file],
+            title: 'Smart Slice Image',
+          });
+          return;
+        }
+      } catch (err) {
+        console.error('Share failed:', err);
+        // Continue to fallback if share was not aborted by user
+        if ((err as Error).name === 'AbortError') return;
+      }
+    }
+
+    // Fallback: Link download (Desktop)
     const link = document.createElement('a');
     link.download = `smart-slice-${Date.now()}.png`;
-    link.href = history[historyIndex].dataUrl;
+    link.href = dataUrl;
     link.click();
   };
 
